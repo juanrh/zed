@@ -761,6 +761,8 @@ async fn retry_with_credentials_refresh<S: Send + 'static>(
 mod tests {
     use super::*;
 
+    use credentials_provider::test_support::FakeCredentialsProvider;
+    use gpui::TestAppContext;
     use http_client::StatusCode;
     use serde_json::json;
 
@@ -1019,6 +1021,150 @@ mod tests {
         disable_response_thinking_for_none_effort(&mut request, &model);
         assert!(!request.thinking_allowed);
         assert_eq!(request.thinking_effort, None);
+    }
+
+    #[gpui::test]
+    async fn no_retry_without_credentials_helper(cx: &mut TestAppContext) {
+        let state = test_helper_state(cx);
+        let mut async_cx = cx.update(|cx| cx.to_async());
+        let first_attempt =
+            futures::future::ready(Err::<futures::stream::BoxStream<'static, i32>, _>(
+                LanguageModelCompletionError::NoApiKey {
+                    provider: LanguageModelProviderName::new("test-provider"),
+                },
+            ))
+            .boxed();
+        let retry = |_new_key: Arc<str>| -> BoxFuture<
+            'static,
+            Result<futures::stream::BoxStream<'static, i32>, LanguageModelCompletionError>,
+        > {
+            panic!("retry must not run when no credentials helper is configured");
+        };
+
+        let result = retry_with_credentials_refresh(
+            first_attempt,
+            retry,
+            Arc::new(smol::lock::Mutex::new(())),
+            state,
+            Some("old-key".into()),
+            None,
+            &mut async_cx,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(LanguageModelCompletionError::NoApiKey { .. })
+        ));
+    }
+
+    #[gpui::test]
+    async fn no_retry_for_non_authentication_errors(cx: &mut TestAppContext) {
+        let state = test_helper_state(cx);
+        let mut async_cx = cx.update(|cx| cx.to_async());
+        let first_attempt = futures::future::ready(Err::<
+            futures::stream::BoxStream<'static, i32>,
+            _,
+        >(provider_rejection(
+            StatusCode::TOO_MANY_REQUESTS,
+            ProviderErrorCategory::RateLimit,
+        )))
+        .boxed();
+        let retry = |_new_key: Arc<str>| -> BoxFuture<
+            'static,
+            Result<futures::stream::BoxStream<'static, i32>, LanguageModelCompletionError>,
+        > {
+            panic!("retry must not run for non-authentication errors");
+        };
+
+        let result = retry_with_credentials_refresh(
+            first_attempt,
+            retry,
+            Arc::new(smol::lock::Mutex::new(())),
+            state,
+            Some("old-key".into()),
+            Some("printf refreshed-key".to_string()),
+            &mut async_cx,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(LanguageModelCompletionError::ProviderRejection { .. })
+        ));
+    }
+
+    #[gpui::test]
+    async fn refresh_api_key_skips_helper_when_key_already_refreshed(cx: &mut TestAppContext) {
+        let credentials = Arc::new(FakeCredentialsProvider::default());
+        credentials
+            .state
+            .lock()
+            .keys
+            .insert("https://example.com/v1".to_string(), b"new-key".to_vec());
+        let state = test_helper_state_with(cx, credentials.clone());
+        let authenticate = cx.update(|cx| state.update(cx, |state, cx| state.authenticate(cx)));
+        cx.run_until_parked();
+        authenticate.await.unwrap();
+        assert!(cx.update(|cx| state.read(cx).is_authenticated()));
+        let mut async_cx = cx.update(|cx| cx.to_async());
+
+        let refreshed_key = refresh_api_key(
+            &smol::lock::Mutex::new(()),
+            state,
+            // The request failed with the old key, but another request already
+            // refreshed the stored key, so the helper must not run.
+            Some("old-key".into()),
+            "printf refreshed-again".to_string(),
+            &mut async_cx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed_key.as_ref(), "new-key");
+        assert_eq!(
+            credentials
+                .state
+                .lock()
+                .keys
+                .get("https://example.com/v1")
+                .map(|key| key.as_slice()),
+            Some(&b"new-key"[..])
+        );
+    }
+
+    fn test_helper_state(cx: &mut TestAppContext) -> Entity<State> {
+        test_helper_state_with(cx, Arc::new(FakeCredentialsProvider::default()))
+    }
+
+    fn test_helper_state_with(
+        cx: &mut TestAppContext,
+        credentials: Arc<FakeCredentialsProvider>,
+    ) -> Entity<State> {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            State::new(
+                "test-provider".into(),
+                credentials,
+                test_settings_resolver,
+                cx,
+            )
+        })
+    }
+
+    fn test_settings_resolver<'a>(
+        _id: &'a str,
+        _cx: &'a App,
+    ) -> Option<&'a OpenAiCompatibleSettings> {
+        static SETTINGS: std::sync::LazyLock<OpenAiCompatibleSettings> =
+            std::sync::LazyLock::new(|| OpenAiCompatibleSettings {
+                api_url: "https://example.com/v1".to_string(),
+                available_models: Vec::new(),
+                custom_headers: CustomHeaders::default(),
+                credentials_helper: None,
+            });
+        Some(&SETTINGS)
     }
 
     fn provider_rejection(

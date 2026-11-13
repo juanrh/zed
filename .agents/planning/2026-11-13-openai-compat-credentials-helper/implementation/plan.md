@@ -10,7 +10,7 @@
 - [x] Step 4: Request-path wiring — retry-once in `stream_chat_completion` and
       `stream_response`; compile + full crate test run.
 - [x] Step 5: Documentation — `docs/src/ai/use-api-access.md` section update.
-- [ ] Step 6: Ponytail review round(s) (max 3) and fixes.
+- [x] Step 6: Ponytail review round(s) (max 3) and fixes.
 
 ## Working agreements
 
@@ -155,4 +155,11 @@ suggestions; at most 3 rounds total, stopping early on a "Ship" verdict.
 
 ### Implementation notes
 
-(to be filled on completion)
+Round 1 (design): ship with two findings incorporated (timeout must kill the
+child — done via `kill_on_drop`; the trigger must be limited to 401 rejections —
+done). Round 2 (code): two findings fixed — the missing `credentials_helper: None`
+in `settings_ui`'s provider-page constructor (masked in this sandbox by a missing
+system glib), and gate tests for the retry orchestration (no-helper and
+non-auth errors surface the original error without retrying; an already-refreshed
+key is reused without running the helper). See `review-round-2.md`. Round 3
+re-review after the fixes.
