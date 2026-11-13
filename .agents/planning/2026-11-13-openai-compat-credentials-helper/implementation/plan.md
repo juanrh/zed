@@ -6,7 +6,7 @@
       `settings_content` and `language_models::settings`, with round-trip test.
 - [x] Step 2: Helper execution + classification — `run_credentials_helper`,
       `is_authentication_rejection`, parse function, unit tests.
-- [ ] Step 3: Refresh orchestration — `refresh_api_key` single-flight logic.
+- [x] Step 3: Refresh orchestration — `refresh_api_key` single-flight logic.
 - [ ] Step 4: Request-path wiring — retry-once in `stream_chat_completion` and
       `stream_response`; compile + full crate test run.
 - [ ] Step 5: Documentation — `docs/src/ai/use-api-access.md` section update.
@@ -86,7 +86,13 @@ failures log (never the key) and return `Err`.
 
 ### Implementation notes
 
-(to be filled on completion)
+Done as designed: `refresh_api_key` takes the single-flight `smol::lock::Mutex`
+guard, refuses env-var keys, skips the helper when the stored key already differs
+from the failed one, runs the helper, persists via `set_api_key`, and re-reads the
+key. One deviation from the plan sketch: it takes `&mut AsyncApp` (gpui's
+`Entity::update` requires a mutable context) and the credentials helper command is
+passed in by the caller rather than re-read from settings. Not yet called; wired in
+step 4.
 
 ---
 

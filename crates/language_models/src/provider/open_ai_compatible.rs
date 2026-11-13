@@ -511,6 +511,53 @@ async fn run_credentials_helper(command: &str) -> Result<String> {
         .context("credentials helper output was not a single API key")
 }
 
+/// Runs the configured credentials helper and stores the API key it prints.
+///
+/// Single-flight: `refresh_lock` serializes concurrent refreshes for this provider,
+/// and if the stored key already differs from `failed_key` (because another request
+/// refreshed it first), the helper is not run again and the current key is returned.
+async fn refresh_api_key(
+    refresh_lock: &smol::lock::Mutex<()>,
+    state: Entity<State>,
+    failed_key: Option<Arc<str>>,
+    credentials_helper: String,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<Arc<str>> {
+    let _refresh_guard = refresh_lock.lock().await;
+
+    let (current_key, is_from_env_var, api_url) = state.read_with(cx, |state, _cx| {
+        let api_url = state.settings.api_url();
+        (
+            state.api_key_state.key(api_url),
+            state.api_key_state.is_from_env_var(),
+            api_url.to_string(),
+        )
+    });
+
+    if is_from_env_var {
+        bail!(
+            "cannot refresh API key: it is set via environment variable, \
+             which the credentials helper cannot update"
+        );
+    }
+
+    if current_key != failed_key {
+        if let Some(current_key) = current_key {
+            return Ok(current_key);
+        }
+    }
+
+    let new_key = run_credentials_helper(&credentials_helper).await?;
+    state
+        .update(cx, |state, cx| state.set_api_key(Some(new_key), cx))
+        .await?;
+
+    let refreshed_key = state.read_with(cx, |state, _cx| state.api_key_state.key(&api_url));
+    refreshed_key.ok_or_else(|| {
+        anyhow!("credentials helper ran, but no API key is stored for {api_url}")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
