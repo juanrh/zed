@@ -9,7 +9,7 @@
 - [x] Step 3: Refresh orchestration — `refresh_api_key` single-flight logic.
 - [x] Step 4: Request-path wiring — retry-once in `stream_chat_completion` and
       `stream_response`; compile + full crate test run.
-- [ ] Step 5: Documentation — `docs/src/ai/use-api-access.md` section update.
+- [x] Step 5: Documentation — `docs/src/ai/use-api-access.md` section update.
 - [ ] Step 6: Ponytail review round(s) (max 3) and fixes.
 
 ## Working agreements
@@ -137,7 +137,13 @@ line on stdout), env-var limitation, and a settings example. Run
 
 ### Implementation notes
 
-(to be filled on completion)
+Added a "Refreshing Expired API Keys with a Credentials Helper" subsection to the
+OpenAI-Compatible Endpoints section of `docs/src/ai/use-api-access.md`: when it
+triggers, the stdout contract, a full settings example, and the limitations
+(shell, 60s timeout, env-var keys excluded, failure behavior, retry-once,
+single-flight). `docs_preprocessor` is part of the docs deploy pipeline and
+expects piped input, so it could not be run standalone here; the example follows
+the existing `[settings]` JSON block conventions used throughout the file.
 
 ---
 
