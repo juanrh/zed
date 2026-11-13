@@ -7,7 +7,7 @@
 - [x] Step 2: Helper execution + classification — `run_credentials_helper`,
       `is_authentication_rejection`, parse function, unit tests.
 - [x] Step 3: Refresh orchestration — `refresh_api_key` single-flight logic.
-- [ ] Step 4: Request-path wiring — retry-once in `stream_chat_completion` and
+- [x] Step 4: Request-path wiring — retry-once in `stream_chat_completion` and
       `stream_response`; compile + full crate test run.
 - [ ] Step 5: Documentation — `docs/src/ai/use-api-access.md` section update.
 - [ ] Step 6: Ponytail review round(s) (max 3) and fixes.
@@ -106,7 +106,25 @@ surface the original error. Run `cargo test -p language_models` and
 
 ### Implementation notes
 
-(to be filled on completion)
+Done with structural deviations forced by gpui:
+- `AsyncApp` is not `Send`, so the attempt/retry orchestration cannot live in the
+  boxed (Send) future. It runs inside a `cx.spawn` task, and the returned future
+  just awaits the `Task`.
+- The spawned task requires `'static` captures, so the single-attempt senders
+  (`send_chat_completion`, `send_response`) are free functions taking owned
+  arguments, and the wire requests are rebuilt per attempt via a
+  `SharedRequestBuilder` closure (`open_ai::Request` / `ResponseRequest` are not
+  `Clone`; `LanguageModelRequest` is, so the closure clones it and re-runs
+  `into_open_ai`/`into_open_ai_response`).
+- `RateLimiter` is `Clone`, so each attempt re-enters the same limiter.
+- The 60s helper timeout uses `smol::Timer` with a targeted, commented
+  `#[allow(clippy::disallowed_methods)]`: the helper does real process I/O, which
+  can never run under gpui's deterministic test scheduler, so
+  `BackgroundExecutor::timer` is not usable here.
+Verification: `cargo test -p language_models --lib` 144 passed; `cargo clippy -p
+language_models` clean; `cargo fmt` applied. `cargo check -p settings_ui` fails in
+this sandbox on a missing system glib (build script / pkg-config), unrelated to the
+change.
 
 ---
 

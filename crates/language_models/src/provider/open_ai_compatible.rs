@@ -10,8 +10,7 @@ use language_model::{
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoiceSupport,
     ModelRateLimiters, PromptCompactionStrategy, ProviderErrorCategory, ProviderSettingsView,
-    RateLimiter,
-    SubPageProviderSettings, unavailable_error,
+    RateLimiter, SubPageProviderSettings, unavailable_error,
 };
 use open_ai::{
     ResponseStreamEvent,
@@ -33,6 +32,11 @@ pub use settings::OpenAiCompatibleModelCapabilities as ModelCapabilities;
 
 const API_KEY_PLACEHOLDER: &str = "000000000000000000000000000000000000000000000000000";
 const CREDENTIALS_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Builds the wire request for a single attempt. Shared so a retried attempt can
+/// rebuild the request, which is not cloneable.
+type SharedRequestBuilder<Req> =
+    Arc<dyn Fn() -> Result<Req, LanguageModelCompletionError> + Send + Sync>;
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct OpenAiCompatibleSettings {
@@ -56,6 +60,9 @@ pub struct OpenAiCompatibleLanguageModelProvider {
     http_client: Arc<dyn HttpClient>,
     state: Entity<State>,
     request_limiters: ModelRateLimiters,
+    /// Serializes credentials helper runs so concurrent requests that fail
+    /// with an expired API key share a single refresh.
+    refresh_lock: Arc<smol::lock::Mutex<()>>,
 }
 
 impl OpenAiCompatibleLanguageModelProvider {
@@ -82,6 +89,7 @@ impl OpenAiCompatibleLanguageModelProvider {
             http_client,
             state,
             request_limiters: ModelRateLimiters::default(),
+            refresh_lock: Arc::new(smol::lock::Mutex::new(())),
         }
     }
 
@@ -137,7 +145,7 @@ impl OpenAiCompatibleLanguageModelProvider {
     fn stream_chat_completion(
         &self,
         request_limiter: &RateLimiter,
-        request: open_ai::Request,
+        build_request: SharedRequestBuilder<open_ai::Request>,
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -149,41 +157,67 @@ impl OpenAiCompatibleLanguageModelProvider {
             LanguageModelCompletionError,
         >,
     > {
-        let http_client = self.http_client.clone();
+        let (api_key, api_url, extra_headers, credentials_helper) =
+            self.state.read_with(cx, |state, _cx| {
+                let api_url = &state.settings.api_url;
+                (
+                    state.api_key_state.key(api_url),
+                    state.settings.api_url.clone(),
+                    state.settings.custom_headers.clone(),
+                    state.settings.credentials_helper.clone(),
+                )
+            });
 
-        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
-            let api_url = &state.settings.api_url;
-            (
-                state.api_key_state.key(api_url),
-                state.settings.api_url.clone(),
-                state.settings.custom_headers.clone(),
+        let send = {
+            let http_client = self.http_client.clone();
+            let provider = self.name.clone();
+            let request_limiter = request_limiter.clone();
+            move |api_key: Option<Arc<str>>,
+                  api_url: String,
+                  extra_headers: CustomHeaders,
+                  build_request: SharedRequestBuilder<open_ai::Request>| {
+                send_chat_completion(
+                    http_client.clone(),
+                    provider.clone(),
+                    request_limiter.clone(),
+                    api_key,
+                    api_url,
+                    extra_headers,
+                    build_request,
+                )
+            }
+        };
+        let first_attempt = send(
+            api_key.clone(),
+            api_url.clone(),
+            extra_headers.clone(),
+            build_request.clone(),
+        );
+        let retry =
+            move |new_key: Arc<str>| send(Some(new_key), api_url, extra_headers, build_request);
+        let state = self.state.clone();
+        let refresh_lock = self.refresh_lock.clone();
+        let cx = cx.clone();
+        let task = cx.spawn(async move |cx| {
+            retry_with_credentials_refresh(
+                first_attempt,
+                retry,
+                refresh_lock,
+                state,
+                api_key,
+                credentials_helper,
+                cx,
             )
+            .await
         });
 
-        let provider = self.name.clone();
-        let future = request_limiter.stream(async move {
-            let Some(api_key) = api_key else {
-                return Err(LanguageModelCompletionError::NoApiKey { provider });
-            };
-            let request = stream_completion(
-                http_client.as_ref(),
-                provider.0.as_str(),
-                &api_url,
-                &api_key,
-                request,
-                &extra_headers,
-            );
-            let response = request.await?;
-            Ok(response)
-        });
-
-        async move { Ok(future.await?.boxed()) }.boxed()
+        task.boxed()
     }
 
     fn stream_response(
         &self,
         request_limiter: &RateLimiter,
-        request: ResponseRequest,
+        build_request: SharedRequestBuilder<ResponseRequest>,
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -192,37 +226,64 @@ impl OpenAiCompatibleLanguageModelProvider {
                 'static,
                 Result<ResponsesStreamEvent, open_ai::RequestError>,
             >,
+            LanguageModelCompletionError,
         >,
     > {
-        let http_client = self.http_client.clone();
+        let (api_key, api_url, extra_headers, credentials_helper) =
+            self.state.read_with(cx, |state, _cx| {
+                let api_url = &state.settings.api_url;
+                (
+                    state.api_key_state.key(api_url),
+                    state.settings.api_url.clone(),
+                    state.settings.custom_headers.clone(),
+                    state.settings.credentials_helper.clone(),
+                )
+            });
 
-        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
-            let api_url = &state.settings.api_url;
-            (
-                state.api_key_state.key(api_url),
-                state.settings.api_url.clone(),
-                state.settings.custom_headers.clone(),
+        let send = {
+            let http_client = self.http_client.clone();
+            let provider = self.name.clone();
+            let request_limiter = request_limiter.clone();
+            move |api_key: Option<Arc<str>>,
+                  api_url: String,
+                  extra_headers: CustomHeaders,
+                  build_request: SharedRequestBuilder<ResponseRequest>| {
+                send_response(
+                    http_client.clone(),
+                    provider.clone(),
+                    request_limiter.clone(),
+                    api_key,
+                    api_url,
+                    extra_headers,
+                    build_request,
+                )
+            }
+        };
+        let first_attempt = send(
+            api_key.clone(),
+            api_url.clone(),
+            extra_headers.clone(),
+            build_request.clone(),
+        );
+        let retry =
+            move |new_key: Arc<str>| send(Some(new_key), api_url, extra_headers, build_request);
+        let state = self.state.clone();
+        let refresh_lock = self.refresh_lock.clone();
+        let cx = cx.clone();
+        let task = cx.spawn(async move |cx| {
+            retry_with_credentials_refresh(
+                first_attempt,
+                retry,
+                refresh_lock,
+                state,
+                api_key,
+                credentials_helper,
+                cx,
             )
+            .await
         });
 
-        let provider = self.name.clone();
-        let future = request_limiter.stream(async move {
-            let Some(api_key) = api_key else {
-                return Err(LanguageModelCompletionError::NoApiKey { provider });
-            };
-            let request = stream_response(
-                http_client.as_ref(),
-                provider.0.as_str(),
-                &api_url,
-                &api_key,
-                request,
-                &extra_headers,
-            );
-            let response = request.await?;
-            Ok(response)
-        });
-
-        async move { Ok(future.await?.boxed()) }.boxed()
+        task.boxed()
     }
 }
 
@@ -315,20 +376,26 @@ impl LanguageModelClient for OpenAiCompatibleLanguageModelProvider {
 
         if config.capabilities.chat_completions {
             let reasoning_effort = chat_completion_reasoning_effort(&request, &config);
-            let request = match into_open_ai(
-                request,
-                &config.name,
-                config.capabilities.parallel_tool_calls,
-                config.capabilities.prompt_cache_key,
-                config.max_output_tokens,
-                chat_completion_max_tokens_parameter(&config),
-                reasoning_effort,
-                config.capabilities.interleaved_reasoning,
-            ) {
-                Ok(request) => request,
-                Err(error) => return async move { Err(error.into()) }.boxed(),
-            };
-            let completions = self.stream_chat_completion(&request_limiter, request, cx);
+            let model_name = config.name.clone();
+            let parallel_tool_calls = config.capabilities.parallel_tool_calls;
+            let prompt_cache_key = config.capabilities.prompt_cache_key;
+            let max_output_tokens = config.max_output_tokens;
+            let max_tokens_parameter = chat_completion_max_tokens_parameter(&config);
+            let interleaved_reasoning = config.capabilities.interleaved_reasoning;
+            let build_request: SharedRequestBuilder<open_ai::Request> = Arc::new(move || {
+                into_open_ai(
+                    request.clone(),
+                    &model_name,
+                    parallel_tool_calls,
+                    prompt_cache_key,
+                    max_output_tokens,
+                    max_tokens_parameter,
+                    reasoning_effort,
+                    interleaved_reasoning,
+                )
+                .map_err(Into::into)
+            });
+            let completions = self.stream_chat_completion(&request_limiter, build_request, cx);
             let executor = cx.background_executor().clone();
             async move {
                 let mapper = ChatCompletionEventMapper::new();
@@ -340,20 +407,27 @@ impl LanguageModelClient for OpenAiCompatibleLanguageModelProvider {
             .boxed()
         } else {
             disable_response_thinking_for_none_effort(&mut request, &config);
-            let request = match into_open_ai_response(
-                request,
-                &config.name,
-                config.capabilities.parallel_tool_calls,
-                config.capabilities.prompt_cache_key,
-                config.max_output_tokens,
-                default_thinking_reasoning_effort(&config),
-                supports_none_reasoning_effort(&config),
-                &self.id,
-            ) {
-                Ok(request) => request,
-                Err(error) => return async move { Err(error.into()) }.boxed(),
-            };
-            let completions = self.stream_response(&request_limiter, request, cx);
+            let model_name = config.name.clone();
+            let parallel_tool_calls = config.capabilities.parallel_tool_calls;
+            let prompt_cache_key = config.capabilities.prompt_cache_key;
+            let max_output_tokens = config.max_output_tokens;
+            let default_reasoning_effort = default_thinking_reasoning_effort(&config);
+            let supports_none_effort = supports_none_reasoning_effort(&config);
+            let compaction_state_owner = self.id.clone();
+            let build_request: SharedRequestBuilder<ResponseRequest> = Arc::new(move || {
+                into_open_ai_response(
+                    request.clone(),
+                    &model_name,
+                    parallel_tool_calls,
+                    prompt_cache_key,
+                    max_output_tokens,
+                    default_reasoning_effort,
+                    supports_none_effort,
+                    &compaction_state_owner,
+                )
+                .map_err(Into::into)
+            });
+            let completions = self.stream_response(&request_limiter, build_request, cx);
             let compaction_state_owner = self.id.clone();
             let executor = cx.background_executor().clone();
             async move {
@@ -473,7 +547,7 @@ async fn run_credentials_helper(command: &str) -> Result<String> {
         command_builder.arg("-c").arg(command);
         command_builder
     };
-    let mut child = shell_command
+    let child = shell_command
         .kill_on_drop(true)
         .stdout(smol::process::Stdio::piped())
         .stderr(smol::process::Stdio::piped())
@@ -481,10 +555,14 @@ async fn run_credentials_helper(command: &str) -> Result<String> {
         .with_context(|| format!("failed to spawn credentials helper command: {command}"))?;
 
     // On timeout, `or` drops the output future, which drops the child and
-    // kills the process because of `kill_on_drop` above.
+    // kills the process because of `kill_on_drop` above. The helper runs real
+    // process I/O, so it can never run under gpui's deterministic test
+    // scheduler; that is also why it uses smol's timer rather than
+    // `BackgroundExecutor::timer`.
     let output = smol::future::or(
         async move { child.output().await.map_err(anyhow::Error::new) },
         async {
+            #[allow(clippy::disallowed_methods)]
             smol::Timer::after(CREDENTIALS_HELPER_TIMEOUT).await;
             Err(anyhow!(
                 "credentials helper did not finish within 60 seconds"
@@ -553,9 +631,130 @@ async fn refresh_api_key(
         .await?;
 
     let refreshed_key = state.read_with(cx, |state, _cx| state.api_key_state.key(&api_url));
-    refreshed_key.ok_or_else(|| {
-        anyhow!("credentials helper ran, but no API key is stored for {api_url}")
-    })
+    refreshed_key
+        .ok_or_else(|| anyhow!("credentials helper ran, but no API key is stored for {api_url}"))
+}
+
+/// Sends one chat-completions request with the given API key.
+fn send_chat_completion(
+    http_client: Arc<dyn HttpClient>,
+    provider: LanguageModelProviderName,
+    request_limiter: RateLimiter,
+    api_key: Option<Arc<str>>,
+    api_url: String,
+    extra_headers: CustomHeaders,
+    build_request: SharedRequestBuilder<open_ai::Request>,
+) -> BoxFuture<
+    'static,
+    Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<ResponseStreamEvent, LanguageModelCompletionError>,
+        >,
+        LanguageModelCompletionError,
+    >,
+> {
+    let future = request_limiter.stream(async move {
+        let Some(api_key) = api_key else {
+            return Err(LanguageModelCompletionError::NoApiKey { provider });
+        };
+        let request = build_request()?;
+        let request = stream_completion(
+            http_client.as_ref(),
+            provider.0.as_str(),
+            &api_url,
+            &api_key,
+            request,
+            &extra_headers,
+        );
+        let response = request.await?;
+        Ok(response)
+    });
+
+    async move { Ok(future.await?.boxed()) }.boxed()
+}
+
+/// Sends one Responses API request with the given API key.
+fn send_response(
+    http_client: Arc<dyn HttpClient>,
+    provider: LanguageModelProviderName,
+    request_limiter: RateLimiter,
+    api_key: Option<Arc<str>>,
+    api_url: String,
+    extra_headers: CustomHeaders,
+    build_request: SharedRequestBuilder<ResponseRequest>,
+) -> BoxFuture<
+    'static,
+    Result<
+        futures::stream::BoxStream<'static, Result<ResponsesStreamEvent, open_ai::RequestError>>,
+        LanguageModelCompletionError,
+    >,
+> {
+    let future = request_limiter.stream(async move {
+        let Some(api_key) = api_key else {
+            return Err(LanguageModelCompletionError::NoApiKey { provider });
+        };
+        let request = build_request()?;
+        let request = stream_response(
+            http_client.as_ref(),
+            provider.0.as_str(),
+            &api_url,
+            &api_key,
+            request,
+            &extra_headers,
+        );
+        let response = request.await?;
+        Ok(response)
+    });
+
+    async move { Ok(future.await?.boxed()) }.boxed()
+}
+
+/// Awaits `first_attempt`; if it was rejected as unauthenticated and a credentials
+/// helper is configured, refreshes the API key and retries once via `retry`.
+/// The first attempt's error is surfaced unchanged when no retry happens or the
+/// refresh fails.
+async fn retry_with_credentials_refresh<S: Send + 'static>(
+    first_attempt: BoxFuture<
+        'static,
+        Result<futures::stream::BoxStream<'static, S>, LanguageModelCompletionError>,
+    >,
+    retry: impl FnOnce(
+        Arc<str>,
+    ) -> BoxFuture<
+        'static,
+        Result<futures::stream::BoxStream<'static, S>, LanguageModelCompletionError>,
+    >,
+    refresh_lock: Arc<smol::lock::Mutex<()>>,
+    state: Entity<State>,
+    failed_key: Option<Arc<str>>,
+    credentials_helper: Option<String>,
+    cx: &mut AsyncApp,
+) -> Result<futures::stream::BoxStream<'static, S>, LanguageModelCompletionError> {
+    let stream = match first_attempt.await {
+        Ok(stream) => stream,
+        Err(error) => {
+            let Some(credentials_helper) = credentials_helper else {
+                return Err(error);
+            };
+            if !is_authentication_rejection(&error) {
+                return Err(error);
+            }
+            match refresh_api_key(&refresh_lock, state, failed_key, credentials_helper, cx).await {
+                Ok(new_key) => {
+                    log::info!("retrying request with API key refreshed by credentials helper");
+                    return retry(new_key).await;
+                }
+                Err(refresh_error) => {
+                    log::error!(
+                        "failed to refresh API key with credentials helper: {refresh_error}"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    };
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -850,9 +1049,10 @@ mod tests {
             StatusCode::FORBIDDEN,
             ProviderErrorCategory::Permission,
         )));
-        assert!(!is_authentication_rejection(
-            &provider_rejection(StatusCode::TOO_MANY_REQUESTS, ProviderErrorCategory::RateLimit),
-        ));
+        assert!(!is_authentication_rejection(&provider_rejection(
+            StatusCode::TOO_MANY_REQUESTS,
+            ProviderErrorCategory::RateLimit
+        ),));
         assert!(!is_authentication_rejection(
             &LanguageModelCompletionError::NoApiKey {
                 provider: LanguageModelProviderName::new("test-provider"),
@@ -889,7 +1089,10 @@ mod tests {
     fn credentials_helper_non_zero_exit_is_an_error() {
         let error =
             smol::block_on(run_credentials_helper("printf 'boom' >&2; exit 1")).unwrap_err();
-        assert!(error.to_string().contains("status"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("status"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
