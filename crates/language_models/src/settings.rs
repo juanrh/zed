@@ -187,6 +187,7 @@ impl settings::Settings for AllLanguageModelSettings {
                                 value.custom_headers,
                                 &[],
                             ),
+                            credentials_helper: value.credentials_helper,
                         },
                     )
                 })

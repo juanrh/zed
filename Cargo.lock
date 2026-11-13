@@ -9658,6 +9658,7 @@ dependencies = [
  "serde_json",
  "settings",
  "sha2",
+ "smol",
  "strum 0.28.0",
  "ui",
  "ui_input",

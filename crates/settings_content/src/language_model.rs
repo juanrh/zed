@@ -425,6 +425,7 @@ pub struct OpenAiCompatibleSettingsContent {
     pub api_url: String,
     pub available_models: Vec<OpenAiCompatibleAvailableModel>,
     pub custom_headers: Option<HashMap<String, String>>,
+    pub credentials_helper: Option<String>,
 }
 
 #[with_fallible_options]
@@ -653,5 +654,48 @@ pub use language_model_core::ModelMode;
 impl MergeFrom for ModelMode {
     fn merge_from(&mut self, other: &Self) {
         *self = *other;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_openai_compatible_credentials_helper() {
+        let content: AllLanguageModelSettingsContent = serde_json::from_value(serde_json::json!({
+            "openai_compatible": {
+                "my-provider": {
+                    "api_url": "https://example.com/v1",
+                    "available_models": [],
+                    "credentials_helper": "pass show example-com/api-key"
+                }
+            }
+        }))
+        .unwrap();
+
+        let settings = content.openai_compatible.unwrap();
+        let provider = settings.get("my-provider").unwrap();
+        assert_eq!(
+            provider.credentials_helper.as_deref(),
+            Some("pass show example-com/api-key")
+        );
+    }
+
+    #[test]
+    fn openai_compatible_credentials_helper_defaults_to_none() {
+        let content: AllLanguageModelSettingsContent = serde_json::from_value(serde_json::json!({
+            "openai_compatible": {
+                "my-provider": {
+                    "api_url": "https://example.com/v1",
+                    "available_models": []
+                }
+            }
+        }))
+        .unwrap();
+
+        let settings = content.openai_compatible.unwrap();
+        let provider = settings.get("my-provider").unwrap();
+        assert_eq!(provider.credentials_helper, None);
     }
 }

@@ -571,3 +571,35 @@ For example, a chat-completions endpoint with the maximum OpenAI-style reasoning
 ```
 
 Enter the API key in the provider settings UI or set the generated environment variable. Do not put API keys in `settings.json`.
+
+### Refreshing Expired API Keys with a Credentials Helper {#openai-compatible-credentials-helper}
+
+OpenAI-compatible providers use long-lived API keys. If the key expires, every request fails with an authentication error. To avoid resetting the key by hand, configure an optional `credentials_helper` command per provider. When Zed detects that a request was rejected as unauthenticated (HTTP 401), it runs the command, reads a new API key from the command's standard output, stores it exactly as if you had entered it in the provider settings UI, and retries the failed request once.
+
+The command must exit with status 0 and print only the new API key to stdout: a single line, with nothing else. Zed trims surrounding whitespace. Zed never logs the helper's output.
+
+```json [settings]
+{
+  "language_models": {
+    "openai_compatible": {
+      "my-provider": {
+        "api_url": "https://example.com/v1",
+        "credentials_helper": "pass show example-com/api-key",
+        "available_models": [
+          {
+            "name": "my-model",
+            "max_tokens": 128000
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+Details and limitations:
+
+- The command runs through your shell (`sh -c` on macOS and Linux, `cmd /C` on Windows) and must finish within 60 seconds.
+- The refresh only applies to API keys stored by Zed (entered in the settings UI). If the key comes from the `<PROVIDER_NAME>_API_KEY` environment variable, the helper is not run, because Zed cannot override that variable.
+- If the helper fails, exits non-zero, prints nothing or more than one line, or times out, the original authentication error is shown and details are written to the log.
+- Each failed request is retried at most once; concurrent requests that fail with the same expired key share a single helper run.
