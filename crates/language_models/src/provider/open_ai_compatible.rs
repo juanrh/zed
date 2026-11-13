@@ -38,6 +38,9 @@ const CREDENTIALS_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
 type SharedRequestBuilder<Req> =
     Arc<dyn Fn() -> Result<Req, LanguageModelCompletionError> + Send + Sync>;
 
+/// Runs a credentials helper command and returns the API key it prints.
+type RunCredentialsHelper = fn(&str) -> BoxFuture<'static, Result<String>>;
+
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct OpenAiCompatibleSettings {
     pub api_url: String,
@@ -157,61 +160,30 @@ impl OpenAiCompatibleLanguageModelProvider {
             LanguageModelCompletionError,
         >,
     > {
-        let (api_key, api_url, extra_headers, credentials_helper) =
-            self.state.read_with(cx, |state, _cx| {
-                let api_url = &state.settings.api_url;
-                (
-                    state.api_key_state.key(api_url),
-                    state.settings.api_url.clone(),
-                    state.settings.custom_headers.clone(),
-                    state.settings.credentials_helper.clone(),
-                )
-            });
-
+        let (api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
+            (
+                state.settings.api_url.clone(),
+                state.settings.custom_headers.clone(),
+            )
+        });
         let send = {
             let http_client = self.http_client.clone();
             let provider = self.name.clone();
             let request_limiter = request_limiter.clone();
-            move |api_key: Option<Arc<str>>,
-                  api_url: String,
-                  extra_headers: CustomHeaders,
-                  build_request: SharedRequestBuilder<open_ai::Request>| {
+            move |api_key: Option<Arc<str>>| {
                 send_chat_completion(
                     http_client.clone(),
                     provider.clone(),
                     request_limiter.clone(),
                     api_key,
-                    api_url,
-                    extra_headers,
-                    build_request,
+                    api_url.clone(),
+                    extra_headers.clone(),
+                    build_request.clone(),
                 )
             }
         };
-        let first_attempt = send(
-            api_key.clone(),
-            api_url.clone(),
-            extra_headers.clone(),
-            build_request.clone(),
-        );
-        let retry =
-            move |new_key: Arc<str>| send(Some(new_key), api_url, extra_headers, build_request);
-        let state = self.state.clone();
-        let refresh_lock = self.refresh_lock.clone();
-        let cx = cx.clone();
-        let task = cx.spawn(async move |cx| {
-            retry_with_credentials_refresh(
-                first_attempt,
-                retry,
-                refresh_lock,
-                state,
-                api_key,
-                credentials_helper,
-                cx,
-            )
-            .await
-        });
 
-        task.boxed()
+        send_with_credentials_refresh(self.state.clone(), self.refresh_lock.clone(), send, cx)
     }
 
     fn stream_response(
@@ -229,61 +201,30 @@ impl OpenAiCompatibleLanguageModelProvider {
             LanguageModelCompletionError,
         >,
     > {
-        let (api_key, api_url, extra_headers, credentials_helper) =
-            self.state.read_with(cx, |state, _cx| {
-                let api_url = &state.settings.api_url;
-                (
-                    state.api_key_state.key(api_url),
-                    state.settings.api_url.clone(),
-                    state.settings.custom_headers.clone(),
-                    state.settings.credentials_helper.clone(),
-                )
-            });
-
+        let (api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
+            (
+                state.settings.api_url.clone(),
+                state.settings.custom_headers.clone(),
+            )
+        });
         let send = {
             let http_client = self.http_client.clone();
             let provider = self.name.clone();
             let request_limiter = request_limiter.clone();
-            move |api_key: Option<Arc<str>>,
-                  api_url: String,
-                  extra_headers: CustomHeaders,
-                  build_request: SharedRequestBuilder<ResponseRequest>| {
+            move |api_key: Option<Arc<str>>| {
                 send_response(
                     http_client.clone(),
                     provider.clone(),
                     request_limiter.clone(),
                     api_key,
-                    api_url,
-                    extra_headers,
-                    build_request,
+                    api_url.clone(),
+                    extra_headers.clone(),
+                    build_request.clone(),
                 )
             }
         };
-        let first_attempt = send(
-            api_key.clone(),
-            api_url.clone(),
-            extra_headers.clone(),
-            build_request.clone(),
-        );
-        let retry =
-            move |new_key: Arc<str>| send(Some(new_key), api_url, extra_headers, build_request);
-        let state = self.state.clone();
-        let refresh_lock = self.refresh_lock.clone();
-        let cx = cx.clone();
-        let task = cx.spawn(async move |cx| {
-            retry_with_credentials_refresh(
-                first_attempt,
-                retry,
-                refresh_lock,
-                state,
-                api_key,
-                credentials_helper,
-                cx,
-            )
-            .await
-        });
 
-        task.boxed()
+        send_with_credentials_refresh(self.state.clone(), self.refresh_lock.clone(), send, cx)
     }
 }
 
@@ -537,56 +478,57 @@ fn parse_helper_output(output: &str) -> Result<String> {
     Ok(key.to_string())
 }
 
-async fn run_credentials_helper(command: &str) -> Result<String> {
-    let mut shell_command = if cfg!(windows) {
-        let mut command_builder = smol::process::Command::new("cmd");
-        command_builder.arg("/C").arg(command);
-        command_builder
-    } else {
-        let mut command_builder = smol::process::Command::new("sh");
-        command_builder.arg("-c").arg(command);
-        command_builder
-    };
-    let child = shell_command
-        .kill_on_drop(true)
-        .stdout(smol::process::Stdio::piped())
-        .stderr(smol::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn credentials helper command: {command}"))?;
+/// Runs the credentials helper command and returns the API key it prints.
+///
+/// Returns a boxed future so tests can substitute a fake runner; a real helper
+/// spawns a process, which cannot run under gpui's deterministic test scheduler.
+fn run_credentials_helper(command: &str) -> BoxFuture<'static, Result<String>> {
+    let command = command.to_string();
+    async move {
+        let mut shell_command = if cfg!(windows) {
+            let mut command_builder = smol::process::Command::new("cmd");
+            command_builder.arg("/C").arg(&command);
+            command_builder
+        } else {
+            let mut command_builder = smol::process::Command::new("sh");
+            command_builder.arg("-c").arg(&command);
+            command_builder
+        };
+        let child = shell_command
+            .kill_on_drop(true)
+            .stdout(smol::process::Stdio::piped())
+            .stderr(smol::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to spawn credentials helper command: {command}"))?;
 
-    // On timeout, `or` drops the output future, which drops the child and
-    // kills the process because of `kill_on_drop` above. The helper runs real
-    // process I/O, so it can never run under gpui's deterministic test
-    // scheduler; that is also why it uses smol's timer rather than
-    // `BackgroundExecutor::timer`.
-    let output = smol::future::or(
-        async move { child.output().await.map_err(anyhow::Error::new) },
-        async {
-            #[allow(clippy::disallowed_methods)]
-            smol::Timer::after(CREDENTIALS_HELPER_TIMEOUT).await;
-            Err(anyhow!(
-                "credentials helper did not finish within 60 seconds"
-            ))
-        },
-    )
-    .await?;
+        // On timeout, `or` drops the output future, which drops the child and
+        // kills the process because of `kill_on_drop` above. The helper runs real
+        // process I/O, so it can never run under gpui's deterministic test
+        // scheduler; that is also why it uses smol's timer rather than
+        // `BackgroundExecutor::timer`.
+        let output = smol::future::or(
+            async move { child.output().await.map_err(anyhow::Error::new) },
+            async {
+                #[allow(clippy::disallowed_methods)]
+                smol::Timer::after(CREDENTIALS_HELPER_TIMEOUT).await;
+                Err(anyhow!(
+                    "credentials helper did not finish within 60 seconds"
+                ))
+            },
+        )
+        .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr_excerpt: String = stderr.trim().chars().take(256).collect();
-        bail!(
-            "credentials helper exited with status {:?}{}",
-            output.status,
-            if stderr_excerpt.is_empty() {
-                String::new()
-            } else {
-                format!("; stderr: {stderr_excerpt}")
-            }
-        );
+        if !output.status.success() {
+            // The helper's stderr may echo secrets, so only the exit status is
+            // reported; the output above drains stderr to keep the helper from
+            // blocking on a full pipe.
+            bail!("credentials helper exited with status {:?}", output.status);
+        }
+
+        parse_helper_output(&String::from_utf8_lossy(&output.stdout))
+            .context("credentials helper output was not a single API key")
     }
-
-    parse_helper_output(&String::from_utf8_lossy(&output.stdout))
-        .context("credentials helper output was not a single API key")
+    .boxed()
 }
 
 /// Runs the configured credentials helper and stores the API key it prints.
@@ -595,6 +537,7 @@ async fn run_credentials_helper(command: &str) -> Result<String> {
 /// and if the stored key already differs from `failed_key` (because another request
 /// refreshed it first), the helper is not run again and the current key is returned.
 async fn refresh_api_key(
+    run_helper: RunCredentialsHelper,
     refresh_lock: &smol::lock::Mutex<()>,
     state: Entity<State>,
     failed_key: Option<Arc<str>>,
@@ -603,12 +546,11 @@ async fn refresh_api_key(
 ) -> anyhow::Result<Arc<str>> {
     let _refresh_guard = refresh_lock.lock().await;
 
-    let (current_key, is_from_env_var, api_url) = state.read_with(cx, |state, _cx| {
+    let (current_key, is_from_env_var) = state.read_with(cx, |state, _cx| {
         let api_url = state.settings.api_url();
         (
             state.api_key_state.key(api_url),
             state.api_key_state.is_from_env_var(),
-            api_url.to_string(),
         )
     });
 
@@ -625,14 +567,12 @@ async fn refresh_api_key(
         }
     }
 
-    let new_key = run_credentials_helper(&credentials_helper).await?;
+    let new_key = run_helper(&credentials_helper).await?;
+    let refreshed_key = Arc::from(new_key.as_str());
     state
         .update(cx, |state, cx| state.set_api_key(Some(new_key), cx))
         .await?;
-
-    let refreshed_key = state.read_with(cx, |state, _cx| state.api_key_state.key(&api_url));
-    refreshed_key
-        .ok_or_else(|| anyhow!("credentials helper ran, but no API key is stored for {api_url}"))
+    Ok(refreshed_key)
 }
 
 /// Sends one chat-completions request with the given API key.
@@ -725,6 +665,7 @@ async fn retry_with_credentials_refresh<S: Send + 'static>(
         'static,
         Result<futures::stream::BoxStream<'static, S>, LanguageModelCompletionError>,
     >,
+    run_helper: RunCredentialsHelper,
     refresh_lock: Arc<smol::lock::Mutex<()>>,
     state: Entity<State>,
     failed_key: Option<Arc<str>>,
@@ -740,7 +681,16 @@ async fn retry_with_credentials_refresh<S: Send + 'static>(
             if !is_authentication_rejection(&error) {
                 return Err(error);
             }
-            match refresh_api_key(&refresh_lock, state, failed_key, credentials_helper, cx).await {
+            match refresh_api_key(
+                run_helper,
+                &refresh_lock,
+                state,
+                failed_key,
+                credentials_helper,
+                cx,
+            )
+            .await
+            {
                 Ok(new_key) => {
                     log::info!("retrying request with API key refreshed by credentials helper");
                     return retry(new_key).await;
@@ -755,6 +705,49 @@ async fn retry_with_credentials_refresh<S: Send + 'static>(
         }
     };
     Ok(stream)
+}
+
+/// Sends a request, refreshing the stored API key with the configured
+/// credentials helper and retrying once when the request is rejected as
+/// unauthenticated. `send` is called once per attempt with the key to use.
+fn send_with_credentials_refresh<S: Send + 'static>(
+    state: Entity<State>,
+    refresh_lock: Arc<smol::lock::Mutex<()>>,
+    send: impl Fn(
+        Option<Arc<str>>,
+    ) -> BoxFuture<
+        'static,
+        Result<futures::stream::BoxStream<'static, S>, LanguageModelCompletionError>,
+    > + 'static,
+    cx: &AsyncApp,
+) -> BoxFuture<'static, Result<futures::stream::BoxStream<'static, S>, LanguageModelCompletionError>>
+{
+    let (api_key, credentials_helper) = state.read_with(cx, |state, _cx| {
+        let api_url = state.settings.api_url();
+        (
+            state.api_key_state.key(api_url),
+            state.settings.credentials_helper.clone(),
+        )
+    });
+
+    let first_attempt = send(api_key.clone());
+    let cx = cx.clone();
+    let task = cx.spawn(async move |cx| {
+        let retry = move |new_key: Arc<str>| send(Some(new_key));
+        retry_with_credentials_refresh(
+            first_attempt,
+            retry,
+            run_credentials_helper,
+            refresh_lock,
+            state,
+            api_key,
+            credentials_helper,
+            cx,
+        )
+        .await
+    });
+
+    task.boxed()
 }
 
 #[cfg(test)]
@@ -1044,6 +1037,7 @@ mod tests {
         let result = retry_with_credentials_refresh(
             first_attempt,
             retry,
+            helper_must_not_run,
             Arc::new(smol::lock::Mutex::new(())),
             state,
             Some("old-key".into()),
@@ -1080,6 +1074,7 @@ mod tests {
         let result = retry_with_credentials_refresh(
             first_attempt,
             retry,
+            helper_must_not_run,
             Arc::new(smol::lock::Mutex::new(())),
             state,
             Some("old-key".into()),
@@ -1110,6 +1105,7 @@ mod tests {
         let mut async_cx = cx.update(|cx| cx.to_async());
 
         let refreshed_key = refresh_api_key(
+            helper_must_not_run,
             &smol::lock::Mutex::new(()),
             state,
             // The request failed with the old key, but another request already
@@ -1131,6 +1127,75 @@ mod tests {
                 .map(|key| key.as_slice()),
             Some(&b"new-key"[..])
         );
+    }
+
+    #[gpui::test]
+    async fn authentication_failure_runs_helper_and_retries_with_new_key(cx: &mut TestAppContext) {
+        let credentials = Arc::new(FakeCredentialsProvider::default());
+        credentials
+            .state
+            .lock()
+            .keys
+            .insert("https://example.com/v1".to_string(), b"old-key".to_vec());
+        let state = test_helper_state_with(cx, credentials.clone());
+        let authenticate = cx.update(|cx| state.update(cx, |state, cx| state.authenticate(cx)));
+        cx.run_until_parked();
+        authenticate.await.unwrap();
+        let mut async_cx = cx.update(|cx| cx.to_async());
+
+        let first_attempt = futures::future::ready(Err::<
+            futures::stream::BoxStream<'static, i32>,
+            _,
+        >(provider_rejection(
+            StatusCode::UNAUTHORIZED,
+            ProviderErrorCategory::Authentication,
+        )))
+        .boxed();
+        let retry_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let retry_keys_for_closure = retry_keys.clone();
+        let retry = move |new_key: Arc<str>| {
+            retry_keys_for_closure
+                .lock()
+                .unwrap()
+                .push(new_key.to_string());
+            futures::future::ready(Ok(futures::stream::empty::<i32>().boxed())).boxed()
+                as BoxFuture<
+                    'static,
+                    Result<futures::stream::BoxStream<'static, i32>, LanguageModelCompletionError>,
+                >
+        };
+
+        let result = retry_with_credentials_refresh(
+            first_attempt,
+            retry,
+            helper_returns_new_key,
+            Arc::new(smol::lock::Mutex::new(())),
+            state,
+            Some("old-key".into()),
+            Some("unused".to_string()),
+            &mut async_cx,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(*retry_keys.lock().unwrap(), ["new-key"]);
+        assert_eq!(
+            credentials
+                .state
+                .lock()
+                .keys
+                .get("https://example.com/v1")
+                .map(|key| key.as_slice()),
+            Some(&b"new-key"[..])
+        );
+    }
+
+    fn helper_must_not_run(_command: &str) -> BoxFuture<'static, Result<String>> {
+        panic!("credentials helper must not run in this test");
+    }
+
+    fn helper_returns_new_key(_command: &str) -> BoxFuture<'static, Result<String>> {
+        futures::future::ready(Ok("new-key".to_string())).boxed()
     }
 
     fn test_helper_state(cx: &mut TestAppContext) -> Entity<State> {
