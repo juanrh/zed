@@ -2,7 +2,7 @@
 
 ## Checklist
 
-- [ ] Step 1: Settings plumbing — `credentials_helper` field through
+- [x] Step 1: Settings plumbing — `credentials_helper` field through
       `settings_content` and `language_models::settings`, with round-trip test.
 - [ ] Step 2: Helper execution + classification — `run_credentials_helper`,
       `is_authentication_rejection`, parse function, unit tests.
@@ -37,7 +37,12 @@ otherwise a deserialization test in `settings_content`).
 
 ### Implementation notes
 
-(to be filled on completion)
+Done as planned. `credentials_helper: Option<String>` added to
+`OpenAiCompatibleSettingsContent` and `OpenAiCompatibleSettings`, mapped in
+`from_settings`. Two serde tests added in `settings_content` (explicit value and
+default `None`); the content struct requires `available_models`, so the test
+fixtures include an empty list. `cargo test -p settings_content --lib language_model`
+and `cargo check -p language_models` pass. No deviations.
 
 ---
 

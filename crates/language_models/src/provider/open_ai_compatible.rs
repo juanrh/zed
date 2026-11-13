@@ -36,6 +36,7 @@ pub struct OpenAiCompatibleSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
     pub custom_headers: CustomHeaders,
+    pub credentials_helper: Option<String>,
 }
 
 impl ApiCompatibleProviderSettings for OpenAiCompatibleSettings {
