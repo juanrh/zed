@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result, anyhow, bail};
 use credentials_provider::CredentialsProvider;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
 use gpui::{App, AppContext, AsyncApp, Entity, Task};
@@ -9,7 +9,8 @@ use language_model::{
     LanguageModelCompletionStream, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoiceSupport,
-    ModelRateLimiters, PromptCompactionStrategy, ProviderSettingsView, RateLimiter,
+    ModelRateLimiters, PromptCompactionStrategy, ProviderErrorCategory, ProviderSettingsView,
+    RateLimiter,
     SubPageProviderSettings, unavailable_error,
 };
 use open_ai::{
@@ -19,6 +20,7 @@ use open_ai::{
 };
 use settings::Settings;
 use std::sync::Arc;
+use std::time::Duration;
 use ui::IconName;
 
 use crate::provider::api_compatible::{
@@ -30,6 +32,7 @@ pub use settings::OpenAiCompatibleAvailableModel as AvailableModel;
 pub use settings::OpenAiCompatibleModelCapabilities as ModelCapabilities;
 
 const API_KEY_PLACEHOLDER: &str = "000000000000000000000000000000000000000000000000000";
+const CREDENTIALS_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct OpenAiCompatibleSettings {
@@ -439,10 +442,80 @@ fn disable_response_thinking_for_none_effort(
     }
 }
 
+fn is_authentication_rejection(error: &LanguageModelCompletionError) -> bool {
+    matches!(
+        error,
+        LanguageModelCompletionError::ProviderRejection {
+            category: ProviderErrorCategory::Authentication,
+            ..
+        }
+    )
+}
+
+fn parse_helper_output(output: &str) -> Result<String> {
+    let key = output.trim();
+    if key.is_empty() {
+        bail!("credentials helper produced no output");
+    }
+    if key.lines().count() > 1 {
+        bail!("credentials helper produced multiple lines of output");
+    }
+    Ok(key.to_string())
+}
+
+async fn run_credentials_helper(command: &str) -> Result<String> {
+    let mut shell_command = if cfg!(windows) {
+        let mut command_builder = smol::process::Command::new("cmd");
+        command_builder.arg("/C").arg(command);
+        command_builder
+    } else {
+        let mut command_builder = smol::process::Command::new("sh");
+        command_builder.arg("-c").arg(command);
+        command_builder
+    };
+    let mut child = shell_command
+        .kill_on_drop(true)
+        .stdout(smol::process::Stdio::piped())
+        .stderr(smol::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn credentials helper command: {command}"))?;
+
+    // On timeout, `or` drops the output future, which drops the child and
+    // kills the process because of `kill_on_drop` above.
+    let output = smol::future::or(
+        async move { child.output().await.map_err(anyhow::Error::new) },
+        async {
+            smol::Timer::after(CREDENTIALS_HELPER_TIMEOUT).await;
+            Err(anyhow!(
+                "credentials helper did not finish within 60 seconds"
+            ))
+        },
+    )
+    .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_excerpt: String = stderr.trim().chars().take(256).collect();
+        bail!(
+            "credentials helper exited with status {:?}{}",
+            output.status,
+            if stderr_excerpt.is_empty() {
+                String::new()
+            } else {
+                format!("; stderr: {stderr_excerpt}")
+            }
+        );
+    }
+
+    parse_helper_output(&String::from_utf8_lossy(&output.stdout))
+        .context("credentials helper output was not a single API key")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use http_client::StatusCode;
     use serde_json::json;
 
     fn available_model(reasoning_effort: Option<open_ai::ReasoningEffort>) -> AvailableModel {
@@ -700,5 +773,85 @@ mod tests {
         disable_response_thinking_for_none_effort(&mut request, &model);
         assert!(!request.thinking_allowed);
         assert_eq!(request.thinking_effort, None);
+    }
+
+    fn provider_rejection(
+        status: StatusCode,
+        category: ProviderErrorCategory,
+    ) -> LanguageModelCompletionError {
+        LanguageModelCompletionError::ProviderRejection {
+            provider: LanguageModelProviderName::new("test-provider"),
+            status: Some(status),
+            code: None,
+            message: "test rejection".to_string(),
+            retry_after: None,
+            category,
+        }
+    }
+
+    #[test]
+    fn authentication_rejections_are_detected() {
+        assert!(is_authentication_rejection(&provider_rejection(
+            StatusCode::UNAUTHORIZED,
+            ProviderErrorCategory::Authentication,
+        )));
+    }
+
+    #[test]
+    fn other_rejections_are_not_treated_as_authentication() {
+        assert!(!is_authentication_rejection(&provider_rejection(
+            StatusCode::FORBIDDEN,
+            ProviderErrorCategory::Permission,
+        )));
+        assert!(!is_authentication_rejection(
+            &provider_rejection(StatusCode::TOO_MANY_REQUESTS, ProviderErrorCategory::RateLimit),
+        ));
+        assert!(!is_authentication_rejection(
+            &LanguageModelCompletionError::NoApiKey {
+                provider: LanguageModelProviderName::new("test-provider"),
+            },
+        ));
+    }
+
+    #[test]
+    fn helper_output_is_trimmed() {
+        assert_eq!(
+            parse_helper_output("  new-api-key\n").unwrap(),
+            "new-api-key"
+        );
+    }
+
+    #[test]
+    fn empty_helper_output_is_rejected() {
+        assert!(parse_helper_output("").is_err());
+        assert!(parse_helper_output("   \n  ").is_err());
+    }
+
+    #[test]
+    fn multi_line_helper_output_is_rejected() {
+        assert!(parse_helper_output("first-key\nsecond-key").is_err());
+    }
+
+    #[test]
+    fn credentials_helper_stdout_becomes_api_key() {
+        let key = smol::block_on(run_credentials_helper("printf '  new-api-key  '")).unwrap();
+        assert_eq!(key, "new-api-key");
+    }
+
+    #[test]
+    fn credentials_helper_non_zero_exit_is_an_error() {
+        let error =
+            smol::block_on(run_credentials_helper("printf 'boom' >&2; exit 1")).unwrap_err();
+        assert!(error.to_string().contains("status"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn credentials_helper_multi_line_stdout_is_an_error() {
+        let error =
+            smol::block_on(run_credentials_helper("printf 'key-one\\nkey-two\\n'")).unwrap_err();
+        assert!(
+            error.to_string().contains("single API key"),
+            "unexpected error: {error}"
+        );
     }
 }

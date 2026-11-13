@@ -4,7 +4,7 @@
 
 - [x] Step 1: Settings plumbing — `credentials_helper` field through
       `settings_content` and `language_models::settings`, with round-trip test.
-- [ ] Step 2: Helper execution + classification — `run_credentials_helper`,
+- [x] Step 2: Helper execution + classification — `run_credentials_helper`,
       `is_authentication_rejection`, parse function, unit tests.
 - [ ] Step 3: Refresh orchestration — `refresh_api_key` single-flight logic.
 - [ ] Step 4: Request-path wiring — retry-once in `stream_chat_completion` and
@@ -64,7 +64,15 @@ multi-line), and a real-process test of `run_credentials_helper` using `printf` 
 
 ### Implementation notes
 
-(to be filled on completion)
+Done with one deviation: `run_credentials_helper` takes no `BackgroundExecutor`.
+`#[gpui::test]` runs under the deterministic test scheduler, which rejects real
+async-io process activity ("Your test is not deterministic"), so the timeout uses
+`smol::Timer::after` directly and the function is executor-independent. The three
+helper tests are plain `#[test]`s using `smol::block_on`. Timeout enforcement relies
+on `kill_on_drop(true)`: on timeout, `smol::future::or` drops the output future,
+dropping the child and killing the process (review finding 1). Tests: classification
+(401 vs 403/429/NoApiKey), parse (trim/empty/multi-line), and real-process runs
+(success, non-zero exit, multi-line stdout). All 22 crate-local tests pass.
 
 ---
 
