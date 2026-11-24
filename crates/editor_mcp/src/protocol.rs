@@ -244,12 +244,12 @@ pub fn method_not_found_response(id: &Value, method: &str) -> String {
     error_response(id, -32601, &format!("method not found: {method}"))
 }
 
-pub fn invalid_frame_response() -> Option<String> {
-    Some(error_response(
+pub fn invalid_frame_response() -> String {
+    error_response(
         &Value::Null,
         -32700,
         "malformed JSON-RPC frame; one frame of JSON per line, ending in a newline, is expected",
-    ))
+    )
 }
 
 fn result_response(id: &Value, result: &Value) -> String {

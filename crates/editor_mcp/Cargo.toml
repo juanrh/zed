@@ -36,6 +36,7 @@ hex.workspace = true
 
 [dev-dependencies]
 project = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
 language_model = { workspace = true, features = ["test-support"] }

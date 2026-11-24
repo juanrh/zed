@@ -174,13 +174,20 @@ impl EditorMcpServer {
                 id: Some(id),
                 method,
             } => {
-                let _ = response_tx.try_send(protocol::method_not_found_response(&id, &method));
+                try_send_response(
+                    &response_tx,
+                    protocol::method_not_found_response(&id, &method),
+                    &id,
+                );
             }
-            Message::UnknownMethod { id: None, .. } | Message::Invalid(_) => {
-                log::warn!("editor MCP server dropped a malformed frame");
-                if let Some(response) = protocol::invalid_frame_response() {
-                    let _ = response_tx.try_send(response);
-                }
+            // Notifications get no reply per JSON-RPC; malformed request
+            // frames get a protocol error so nothing waits on them forever.
+            Message::UnknownMethod { id: None, method } => {
+                log::warn!("editor MCP server dropped an unknown notification: {method}");
+            }
+            Message::Invalid(reason) => {
+                log::warn!("editor MCP server dropped a malformed frame: {reason}");
+                try_send_response(&response_tx, protocol::invalid_frame_response(), &serde_json::Value::Null);
             }
         }
     }
@@ -198,21 +205,26 @@ impl EditorMcpServer {
             Action::Initialize {
                 requested_protocol_version,
             } => {
-                let _ = response_tx.try_send(protocol::initialize_result(
+                try_send_response(
+                    &response_tx,
+                    protocol::initialize_result(&id, &requested_protocol_version),
                     &id,
-                    &requested_protocol_version,
-                ));
+                );
             }
             Action::Ping => {
-                let _ = response_tx.try_send(protocol::ping_result(&id));
+                try_send_response(&response_tx, protocol::ping_result(&id), &id);
             }
             Action::ListTools => {
                 let tools = self.dispatcher.tools(cx);
-                let _ = response_tx.try_send(protocol::tools_list_result(&id, &tools));
+                try_send_response(&response_tx, protocol::tools_list_result(&id, &tools), &id);
             }
             Action::CallToolError { invalid_request } => {
                 let outcome = ToolCallOutcome::error(invalid_request);
-                let _ = response_tx.try_send(protocol::tools_call_result(&id, &outcome));
+                try_send_response(
+                    &response_tx,
+                    protocol::tools_call_result(&id, &outcome),
+                    &id,
+                );
             }
             Action::CallTool { name, arguments } => {
                 self.dispatch_call(conn_id, id, name, arguments, response_tx, cx)
@@ -241,7 +253,11 @@ impl EditorMcpServer {
                  response before issuing another (open another connection for \
                  parallel calls)",
             );
-            let _ = response_tx.try_send(protocol::tools_call_result(&id, &outcome));
+            try_send_response(
+                &response_tx,
+                protocol::tools_call_result(&id, &outcome),
+                &id,
+            );
             return;
         }
         conn.pending_calls += 1;
@@ -267,11 +283,20 @@ impl EditorMcpServer {
     ) {
         // R10: pending-map cleanup happens exactly where the response is
         // sent. `try_send` is a no-op if the client already disconnected.
-        self.pending.remove(&(conn_id, id.clone()));
-        if let Some(conn) = self.connections.get_mut(&conn_id) {
-            conn.pending_calls = conn.pending_calls.saturating_sub(1);
+        // The in-flight counter decrements exactly once per call: here only
+        // if this completion is still the registered pending entry — a
+        // cancelled call's entry was removed (and counted) by the cancel
+        // handler, so this must not decrement again (round-2 review, finding 1).
+        if self.pending.remove(&(conn_id, id.clone())).is_some() {
+            if let Some(conn) = self.connections.get_mut(&conn_id) {
+                conn.pending_calls = conn.pending_calls.saturating_sub(1);
+            }
         }
-        let _ = response_tx.try_send(protocol::tools_call_result(id, &outcome));
+        try_send_response(
+            &response_tx,
+            protocol::tools_call_result(id, &outcome),
+            id,
+        );
     }
 
     /// Stops serving this workspace: cancels every in-flight call and removes
@@ -305,6 +330,22 @@ impl EditorMcpServer {
 /// Binds the socket, honoring the dual-window tiebreak: a live listener from
 /// another Zed window means this window must stand down (Ok(None)), while a
 /// dead socket file from a crashed process is reclaimed and bound once.
+
+/// Sends a response frame, logging when it is dropped instead of failing
+/// silently (round-2 review, finding 2). Drops only happen when the client
+/// stops reading: the per-connection channel is bounded.
+fn try_send_response(
+    response_tx: &smol::channel::Sender<String>,
+    response: String,
+    request_id: &serde_json::Value,
+) {
+    if response_tx.try_send(response).is_err() {
+        log::warn!(
+            "editor MCP response dropped: client is not reading (request id {request_id})"
+        );
+    }
+}
+
 fn bind(path: &Path) -> std::io::Result<Option<std::os::unix::net::UnixListener>> {
     match std::os::unix::net::UnixListener::bind(path) {
         Ok(listener) => Ok(Some(listener)),
