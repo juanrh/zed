@@ -8,9 +8,12 @@ use tokio::net::UnixStream;
 pub const BRIDGE_METHOD: &str = "agent_tool/run";
 pub const DEFAULT_SOCKET_FILE: &str = "zed-agent-tool-bridge.sock";
 
+const DEFAULT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[derive(Clone)]
 pub struct AgentBridgeClient {
     socket_path: PathBuf,
+    response_timeout: std::time::Duration,
 }
 
 #[derive(Serialize)]
@@ -41,14 +44,13 @@ struct BridgeError {
 
 impl AgentBridgeClient {
     pub fn from_environment() -> Self {
-        Self {
-            socket_path: socket_path_from_environment(),
-        }
+        Self::from_socket_path(socket_path_from_environment())
     }
 
     pub fn from_socket_path(socket_path: PathBuf) -> Self {
         Self {
             socket_path,
+            response_timeout: response_timeout_from_environment(),
         }
     }
 
@@ -56,11 +58,8 @@ impl AgentBridgeClient {
         &self.socket_path
     }
 
-    pub async fn is_available(&self) -> bool {
-        self.connect()
-            .await
-            .map(|_stream| true)
-            .unwrap_or(false)
+    pub fn response_timeout(&self) -> std::time::Duration {
+        self.response_timeout
     }
 
     pub async fn run_tool(&self, tool_name: &str, input: &Value) -> Result<String> {
@@ -78,39 +77,47 @@ impl AgentBridgeClient {
             jsonrpc: "2.0",
             id: 1,
             method: BRIDGE_METHOD,
-            params: ToolRunParams { tool: tool_name, input },
+            params: ToolRunParams {
+                tool: tool_name,
+                input,
+            },
         };
-        let mut request_line = serde_json::to_string(&request)
-            .context("serializing the agent tool bridge request")?;
+        let mut request_line =
+            serde_json::to_string(&request).context("serializing the agent tool bridge request")?;
         request_line.push('\n');
         writer
             .write_all(request_line.as_bytes())
             .await
-            .with_context(|| format!("sending the `{tool_name}` request to the agent tool bridge"))?;
-        writer
-            .flush()
-            .await
-            .with_context(|| format!("flushing the `{tool_name}` request to the agent tool bridge"))?;
+            .with_context(|| {
+                format!("sending the `{tool_name}` request to the agent tool bridge")
+            })?;
+        writer.flush().await.with_context(|| {
+            format!("flushing the `{tool_name}` request to the agent tool bridge")
+        })?;
 
         let mut reader = BufReader::new(reader);
         let mut response_line = String::new();
-        let read_bytes = tokio::time::timeout(RESPONSE_TIMEOUT, reader.read_line(&mut response_line))
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "the `{tool_name}` call did not get a reply from the agent tool bridge \
-                     within {} seconds",
-                    RESPONSE_TIMEOUT.as_secs()
-                )
-            })?
-            .with_context(|| format!("reading the `{tool_name}` reply from the agent tool bridge"))?;
+        let read_bytes =
+            tokio::time::timeout(self.response_timeout, reader.read_line(&mut response_line))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "the `{tool_name}` call did not get a reply from the agent tool bridge \
+                         within {} seconds; permission-gated tools wait for the user to \
+                         confirm inside Zed, so raise ZED_AGENT_BRIDGE_TIMEOUT_SECS if needed",
+                        self.response_timeout.as_secs()
+                    )
+                })?
+                .with_context(|| {
+                    format!("reading the `{tool_name}` reply from the agent tool bridge")
+                })?;
         if read_bytes == 0 {
-            bail!(
-                "the agent tool bridge closed the connection without a reply for `{tool_name}`"
-            );
+            bail!("the agent tool bridge closed the connection without a reply for `{tool_name}`");
         }
-        let response: ToolRunResponse = serde_json::from_str(&response_line)
-            .with_context(|| format!("parsing the `{tool_name}` reply from the agent tool bridge"))?;
+        let response: ToolRunResponse =
+            serde_json::from_str(&response_line).with_context(|| {
+                format!("parsing the `{tool_name}` reply from the agent tool bridge")
+            })?;
         if let Some(error) = response.error {
             bail!("`{tool_name}` failed in Zed: {}", error.message);
         }
@@ -126,17 +133,17 @@ impl AgentBridgeClient {
     }
 
     async fn connect(&self) -> Result<UnixStream> {
-        let stream = UnixStream::connect(&self.socket_path).await.with_context(|| {
-            format!(
-                "connecting to the agent tool bridge socket {}",
-                self.socket_path.display()
-            )
-        })?;
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "connecting to the agent tool bridge socket {}",
+                    self.socket_path.display()
+                )
+            })?;
         Ok(stream)
     }
 }
-
-const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn socket_path_from_environment() -> PathBuf {
     if let Some(socket_path) = std::env::var_os("ZED_AGENT_BRIDGE_SOCKET") {
@@ -145,6 +152,15 @@ fn socket_path_from_environment() -> PathBuf {
         }
     }
     paths::data_dir().join(DEFAULT_SOCKET_FILE)
+}
+
+fn response_timeout_from_environment() -> std::time::Duration {
+    std::env::var("ZED_AGENT_BRIDGE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_RESPONSE_TIMEOUT)
 }
 
 #[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
@@ -171,7 +187,10 @@ pub struct EditBridgeInput {
 }
 
 #[derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
+// Reject unknown fields so that a mistyped scoping parameter (e.g. `path`) fails
+// loudly instead of being silently dropped, which would widen the search. This
+// matches the upstream `GrepToolInput` contract.
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct GrepBridgeInput {
     /// A regex pattern to search for in the project (parsed by the Rust `regex` crate).
     pub regex: String,
@@ -242,7 +261,9 @@ mod tests {
                             break;
                         }
                         let line = String::from_utf8_lossy(&buffer).trim().to_string();
-                        let _ = request_sender.send(serde_json::from_str(&line).unwrap()).await;
+                        let _ = request_sender
+                            .send(serde_json::from_str(&line).unwrap())
+                            .await;
                         buffer.clear();
                         let response = match error_message {
                             Some(message) => json!({
@@ -306,7 +327,8 @@ mod tests {
             spawn_fake_bridge(temp_dir.path(), "", Some("file not found: backend/main.rs")).await;
         let client = AgentBridgeClient::from_socket_path(temp_dir.path().join("bridge.sock"));
 
-        let error = client.run_tool("diagnostics", &json!({"path": "backend/main.rs"}))
+        let error = client
+            .run_tool("diagnostics", &json!({"path": "backend/main.rs"}))
             .await
             .unwrap_err();
         let message = format!("{error:#}");

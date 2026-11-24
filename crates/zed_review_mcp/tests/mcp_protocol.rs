@@ -145,9 +145,9 @@ async fn start_server_with_bridge(
     let agent_bridge = bridge_socket_path
         .map(AgentBridgeClient::from_socket_path)
         .unwrap_or_else(|| {
-            AgentBridgeClient::from_socket_path(
-                std::path::PathBuf::from("/nonexistent/zed-agent-tool-bridge.sock"),
-            )
+            AgentBridgeClient::from_socket_path(std::path::PathBuf::from(
+                "/nonexistent/zed-agent-tool-bridge.sock",
+            ))
         });
     tokio::spawn(async move {
         let server = ReviewServer::with_agent_bridge(review_store, zed_opener, agent_bridge);
@@ -565,8 +565,7 @@ async fn test_bridge_tools_forward_to_agent_tool_bridge() {
 
     let bridge_dir = tempfile::TempDir::new().unwrap();
     let socket_path = bridge_dir.path().join("bridge.sock");
-    let (request_sender, mut request_receiver) =
-        tokio::sync::mpsc::channel::<serde_json::Value>(8);
+    let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel::<serde_json::Value>(8);
     let listener_socket_path = socket_path.clone();
     tokio::spawn(async move {
         let listener = tokio::net::UnixListener::bind(&listener_socket_path).unwrap();
@@ -610,19 +609,18 @@ async fn test_bridge_tools_forward_to_agent_tool_bridge() {
         }
     });
 
-    let mut client = start_server_with_bridge(
-        &project,
-        &fake_zed,
-        Some(socket_path.clone()),
-    )
-    .await
-    .unwrap();
+    let mut client = start_server_with_bridge(&project, &fake_zed, Some(socket_path.clone()))
+        .await
+        .unwrap();
 
     let outcome = client
-        .call_tool("edit_file", json!({
-            "path": "backend/src/main.rs",
-            "edits": [{"old_text": "a", "new_text": "b"}],
-        }))
+        .call_tool(
+            "edit_file",
+            json!({
+                "path": "backend/src/main.rs",
+                "edits": [{"old_text": "a", "new_text": "b"}],
+            }),
+        )
         .await
         .unwrap();
     assert!(!outcome.is_error, "{}", outcome.text);

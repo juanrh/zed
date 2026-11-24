@@ -59,3 +59,32 @@ local `zed` executable), atomic restores. Implemented on the official
    review UI (approve/reject buttons inside Zed), diagnostics/active-editor context
    tools, branch-diff review.
 3. Consider publishing the binary for easy `uvx`-style usage by agent hosts.
+
+
+## Revision 2 (post-review): the agent tool bridge
+
+The reviewer asked why we re-implemented Aletheia's baseline flow inside zed instead of
+exposing the Zed agent's own tools so external agents reuse the same code paths and the
+same review diff. Investigation (`research/agent-tool-bridge.md`) found:
+
+- The agent's tools (`crates/agent/src/tools/*`, `AgentTool` in
+  `crates/agent/src/thread.rs:5511`) are bound to the live `Project`/`Thread` entity
+  graph — a literal "extract into a shared library" is a re-architecture of the editor
+  core, not a tool refactor.
+- The right reuse is in-process: a running Zed can construct the agent's **own** tool
+  objects and run them; the pending-edit review then is the agent panel's identical
+  rich-diff flow.
+
+The design now makes the **agent tool bridge** the primary architecture: the new
+`agent_bridge` module talks JSON-RPC `agent_tool/run` over a Unix socket
+(`ZED_AGENT_BRIDGE_SOCKET`) to the running Zed, and the MCP server exposes gateway
+tools with schema parity — `edit_file`, `grep`, `diagnostics` implemented in this
+revision (60 tests, all green), full tool-coverage matrix and phasing for the rest of
+https://zed.dev/docs/ai/tools in the research document. The Aletheia-style tools stay
+as the documented offline fallback (they are today's only complete flow for Zeds
+without the bridge; deleting them later is a one-commit follow-up). The app-side
+listener is specified to file/line level (`design/detailed-design.md` Revision 2) and
+is the next phase: it must be built on a machine that can compile Zed's `gpui`
+app crates.
+
+Ponytail review rounds 4–6 cover the revision-2 delta (round 6 verdict: **ship**).

@@ -301,8 +301,8 @@ impl ReviewServer {
         Parameters(input): Parameters<DiagnosticsBridgeInput>,
     ) -> Result<CallToolResult, McpError> {
         run_tool_async(async {
-            let forwarded_input = serde_json::to_value(&input)
-                .context("serializing diagnostics input")?;
+            let forwarded_input =
+                serde_json::to_value(&input).context("serializing diagnostics input")?;
             let reply = self
                 .agent_bridge
                 .run_tool("diagnostics", &forwarded_input)
