@@ -5,6 +5,7 @@ use common::{FakeZed, TestProject};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
+use zed_review_mcp::agent_bridge::AgentBridgeClient;
 use zed_review_mcp::review_server::ReviewServer;
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -130,11 +131,26 @@ struct ToolOutcome {
 }
 
 async fn start_server(project: &TestProject, fake_zed: &FakeZed) -> Result<RawMcpClient> {
+    start_server_with_bridge(project, fake_zed, None).await
+}
+
+async fn start_server_with_bridge(
+    project: &TestProject,
+    fake_zed: &FakeZed,
+    bridge_socket_path: Option<std::path::PathBuf>,
+) -> Result<RawMcpClient> {
     let review_store = Arc::new(project.store());
     let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
     let zed_opener = Arc::new(fake_zed.opener());
+    let agent_bridge = bridge_socket_path
+        .map(AgentBridgeClient::from_socket_path)
+        .unwrap_or_else(|| {
+            AgentBridgeClient::from_socket_path(
+                std::path::PathBuf::from("/nonexistent/zed-agent-tool-bridge.sock"),
+            )
+        });
     tokio::spawn(async move {
-        let server = ReviewServer::new(review_store, zed_opener);
+        let server = ReviewServer::with_agent_bridge(review_store, zed_opener, agent_bridge);
         use rmcp::ServiceExt;
         match server.serve(server_stream).await {
             Ok(service) => {
@@ -163,8 +179,11 @@ async fn test_metadata_lists_review_tools_with_descriptions() {
         names,
         vec![
             "approve",
+            "diagnostics",
             "edit",
+            "edit_file",
             "get_change_status",
+            "grep",
             "open_paths",
             "open_review",
             "record_baseline",
@@ -534,6 +553,134 @@ async fn test_tool_errors_report_is_error_with_offending_path() {
     assert!(outcome.is_error, "{}", outcome.text);
     assert!(
         outcome.text.contains("missing.py") && outcome.text.contains("no baseline"),
+        "{}",
+        outcome.text
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_bridge_tools_forward_to_agent_tool_bridge() {
+    let project = TestProject::new();
+    let fake_zed = FakeZed::new();
+
+    let bridge_dir = tempfile::TempDir::new().unwrap();
+    let socket_path = bridge_dir.path().join("bridge.sock");
+    let (request_sender, mut request_receiver) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(8);
+    let listener_socket_path = socket_path.clone();
+    tokio::spawn(async move {
+        let listener = tokio::net::UnixListener::bind(&listener_socket_path).unwrap();
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let request_sender = request_sender.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(reader);
+                let mut request_line = String::new();
+                use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+                loop {
+                    request_line.clear();
+                    if reader.read_line(&mut request_line).await.unwrap() == 0 {
+                        return;
+                    }
+                    let request: serde_json::Value =
+                        serde_json::from_str(request_line.trim()).unwrap();
+                    let _ = request_sender.send(request["params"].clone()).await;
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": format!(
+                                    "ran in zed: {}",
+                                    request["params"]["tool"].as_str().unwrap()
+                                ),
+                            }],
+                        },
+                    });
+                    writer
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+    });
+
+    let mut client = start_server_with_bridge(
+        &project,
+        &fake_zed,
+        Some(socket_path.clone()),
+    )
+    .await
+    .unwrap();
+
+    let outcome = client
+        .call_tool("edit_file", json!({
+            "path": "backend/src/main.rs",
+            "edits": [{"old_text": "a", "new_text": "b"}],
+        }))
+        .await
+        .unwrap();
+    assert!(!outcome.is_error, "{}", outcome.text);
+    assert!(
+        outcome.text.contains("edit_file executed in Zed"),
+        "{}",
+        outcome.text
+    );
+    assert!(
+        outcome.text.contains("ran in zed: edit_file"),
+        "{}",
+        outcome.text
+    );
+    let forwarded = request_receiver.recv().await.unwrap();
+    assert_eq!(forwarded["tool"], "edit_file");
+    assert_eq!(forwarded["path"], "backend/src/main.rs");
+    assert_eq!(forwarded["edits"][0]["old_text"], "a");
+
+    let outcome = client
+        .call_tool("grep", json!({"regex": "match", "case_sensitive": false}))
+        .await
+        .unwrap();
+    assert!(
+        outcome.text.contains("ran in zed: grep"),
+        "{}",
+        outcome.text
+    );
+    let forwarded = request_receiver.recv().await.unwrap();
+    assert_eq!(forwarded["tool"], "grep");
+    assert_eq!(forwarded["regex"], "match");
+
+    let outcome = client
+        .call_tool("diagnostics", json!({"path": "backend/main.rs"}))
+        .await
+        .unwrap();
+    assert!(
+        outcome.text.contains("ran in zed: diagnostics"),
+        "{}",
+        outcome.text
+    );
+    let forwarded = request_receiver.recv().await.unwrap();
+    assert_eq!(forwarded["tool"], "diagnostics");
+    assert_eq!(forwarded["path"], "backend/main.rs");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_bridge_tools_report_actionable_errors_when_bridge_is_down() {
+    let project = TestProject::new();
+    let fake_zed = FakeZed::new();
+    let mut client = start_server(&project, &fake_zed).await.unwrap();
+    let outcome = client
+        .call_tool("grep", json!({"regex": "anything"}))
+        .await
+        .unwrap();
+    assert!(outcome.is_error, "{}", outcome.text);
+    assert!(outcome.text.contains("grep"), "{}", outcome.text);
+    assert!(
+        outcome.text.contains("ZED_AGENT_BRIDGE_SOCKET"),
         "{}",
         outcome.text
     );

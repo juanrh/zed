@@ -8,6 +8,7 @@ Converts the design into test-first, demoable increments. The design document
 - [x] Step 1: crate scaffold + baseline review store (record/status/approve/reject) with tests
 - [x] Step 2: MCP server on rmcp with the review tools wired to the store
 - [x] Step 3: ZedOpener (`open_review`, `open_paths`) + edit tool + binary end-to-end
+- [x] Step 4 (rev 2): agent tool bridge gateway — protocol, schema-parity tools (edit_file, grep, diagnostics), protocol tests against a fake bridge
 
 ## Working agreements
 
@@ -132,3 +133,31 @@ Docs: crate `README.md` (workflow, tool table, Vibe config with `disabled_tools`
 session semantics). Verified: `cargo test -p zed_review_mcp` — 53 passed (42 unit + 6
 protocol + 2 main.rs/bin arg + 3 integration totals across suites);
 `cargo clippy -p zed_review_mcp --all-targets` clean; `cargo fmt --check` clean.
+
+
+---
+
+## Step 4 (Revision 2) — Implementation notes
+
+Revision 2 re-aims the feature per review feedback: expose the Zed agent's own tools
+(edit_file, grep, diagnostics first) instead of only re-implementing the Aletheia-style
+flow. Research (`research/agent-tool-bridge.md`) confirmed the tools are app-bound
+(`AgentTool::run(Arc<Self>, ToolInput, ToolCallEventStream, &mut App)` over live
+`Project`/`Thread` entities), so the architecture is the **agent tool bridge**: the
+running Zed listens on a Unix socket and executes requests by constructing the agent's
+own tool objects; this crate is the MCP gateway. Implemented here: `src/agent_bridge.rs`
+(JSON-RPC `agent_tool/run` client, socket from `ZED_AGENT_BRIDGE_SOCKET` or
+`paths::data_dir()/zed-agent-tool-bridge.sock`, 120s response timeout, actionable
+guidance when the bridge is unreachable) and three gateway tools with schema parity:
+`edit_file` (path + edits[{old_text,new_text}] mirrors `EditFileToolInput`;
+forwarded flattened like the agent's input), `grep` (regex, include_pattern, offset,
+case_sensitive mirrors `GrepToolInput`), `diagnostics` (path? mirrors
+`DiagnosticsToolInput`). Tests: bridge client unit tests against fake Unix-socket
+bridges (forwarding, error surfacing naming the tool, unreachable-socket guidance,
+edit-forward shape), plus protocol-level tests driving the MCP server over duplex with a
+fake bridge (edit_file → reply text, forwarded params asserted per tool; bridge down →
+isError with ZED_AGENT_BRIDGE_SOCKET guidance). Existing offline tools unchanged and
+repositioned as fallback in docs/tool descriptions. Verified: `cargo test -p
+zed_review_mcp` — 60 passed; `cargo clippy --all-targets` clean; `cargo fmt --check`
+clean. The app-side listener is fully specified in the design (Revision 2) and must land
+from a machine that can build Zed's app crates; that work list is phasing item (2).

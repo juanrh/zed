@@ -1,3 +1,7 @@
+use crate::agent_bridge::{
+    AgentBridgeClient, DiagnosticsBridgeInput, EditFileBridgeInput, GrepBridgeInput,
+    edit_file_forward_input,
+};
 use crate::review_store::{RecordOutcome, ReviewStore};
 use crate::zed_opener::ZedOpener;
 use anyhow::{Context as _, Error, Result};
@@ -15,6 +19,7 @@ pub const SERVER_NAME: &str = "zed-review-mcp";
 pub struct ReviewServer {
     review_store: Arc<ReviewStore>,
     zed_opener: Arc<ZedOpener>,
+    agent_bridge: AgentBridgeClient,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -109,9 +114,22 @@ where
 
 impl ReviewServer {
     pub fn new(review_store: Arc<ReviewStore>, zed_opener: Arc<ZedOpener>) -> Self {
+        Self::with_agent_bridge(
+            review_store,
+            zed_opener,
+            AgentBridgeClient::from_environment(),
+        )
+    }
+
+    pub fn with_agent_bridge(
+        review_store: Arc<ReviewStore>,
+        zed_opener: Arc<ZedOpener>,
+        agent_bridge: AgentBridgeClient,
+    ) -> Self {
         Self {
             review_store,
             zed_opener,
+            agent_bridge,
             tool_router: Self::tool_router(),
         }
     }
@@ -228,6 +246,70 @@ impl ReviewServer {
             }
             Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
         })
+    }
+
+    #[tool(
+        description = "Edit a file in the open Zed project, running the editor's own \\
+        `edit_file` agent tool through the agent tool bridge: the same code path, and \\
+        the same rich review — pending edits appear in Zed's agent panel, where the user \\
+        can review the diff, edit it, run linters and tests, and approve or reject. \\
+        Prefer this over shell-based edits whenever the bridge is reachable."
+    )]
+    async fn edit_file(
+        &self,
+        Parameters(input): Parameters<EditFileBridgeInput>,
+    ) -> Result<CallToolResult, McpError> {
+        run_tool_async(async {
+            let forwarded_input = edit_file_forward_input(&input);
+            let reply = self
+                .agent_bridge
+                .run_tool("edit_file", &forwarded_input)
+                .await?;
+            let mut message =
+                String::from("edit_file executed in Zed (reviewable as pending edits)\n");
+            message.push_str(&reply);
+            Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Search file contents in the open Zed project with a regular \\
+        expression, running the editor's own `grep` agent tool through the agent tool \\
+        bridge — the same search implementation, pagination and context the built-in \\
+        Zed agent uses."
+    )]
+    async fn grep(
+        &self,
+        Parameters(input): Parameters<GrepBridgeInput>,
+    ) -> Result<CallToolResult, McpError> {
+        run_tool_async(async {
+            let forwarded_input = serde_json::to_value(&input).context("serializing grep input")?;
+            let reply = self.agent_bridge.run_tool("grep", &forwarded_input).await?;
+            Ok(CallToolResult::success(vec![ContentBlock::text(reply)]))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Get errors and warnings from the open Zed project's language \\
+        servers, running the editor's own `diagnostics` agent tool through the agent \\
+        tool bridge. Call after edits to see whether further changes are needed."
+    )]
+    async fn diagnostics(
+        &self,
+        Parameters(input): Parameters<DiagnosticsBridgeInput>,
+    ) -> Result<CallToolResult, McpError> {
+        run_tool_async(async {
+            let forwarded_input = serde_json::to_value(&input)
+                .context("serializing diagnostics input")?;
+            let reply = self
+                .agent_bridge
+                .run_tool("diagnostics", &forwarded_input)
+                .await?;
+            Ok(CallToolResult::success(vec![ContentBlock::text(reply)]))
+        })
+        .await
     }
 
     #[tool(

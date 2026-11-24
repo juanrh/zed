@@ -22995,6 +22995,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "log",
+ "paths",
  "rmcp",
  "schemars 1.0.4",
  "serde",
