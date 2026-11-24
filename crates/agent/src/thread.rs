@@ -4522,6 +4522,70 @@ impl Thread {
         self.tools.contains_key(name)
     }
 
+    /// The tool registered on this thread under `name` (via `add_tool`, e.g.
+    /// by `add_default_tools`), regardless of any running model turn.
+    pub fn registered_tool(&self, name: &str) -> Option<Arc<dyn AnyAgentTool>> {
+        self.tools.get(name).cloned()
+    }
+
+    /// All tools registered on this thread.
+    pub fn registered_tools(&self) -> Vec<Arc<dyn AnyAgentTool>> {
+        self.tools.values().cloned().collect()
+    }
+
+    /// Runs a tool registered on this thread outside of a model turn, with
+    /// its own event stream and cancellation channel.
+    ///
+    /// This is the seam for driving the built-in agent tools from other
+    /// editor surfaces (e.g. the in-editor MCP server): the tool executes the
+    /// exact code path it would inside a turn — buffers, saves, action log,
+    /// and its own permission requests, which surface as events on the
+    /// returned run and must be answered by the caller (denying is always
+    /// safe).
+    pub fn run_external_tool(
+        &mut self,
+        name: &str,
+        input: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> Option<ExternalToolRun> {
+        let tool = self.registered_tool(name)?;
+        if !tool.allow_in_restricted_mode()
+            && TrustedWorktrees::has_restricted_worktrees(&self.project.read(cx).worktree_store(), cx)
+        {
+            return Some(ExternalToolRun::from_error(
+                tool,
+                "workspace has become restricted",
+            ));
+        }
+        let tool_use_id = LanguageModelToolUseId::from(format!("external:{name}").as_str());
+        let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
+        let event_stream = ThreadEventStream::new(events_tx);
+        let (cancellation_tx, cancellation_rx) = watch::channel(false);
+        let tool_call_id = scoped_tool_call_id(0, &tool_use_id);
+        let tool_event_stream = ToolCallEventStream::new(
+            tool_use_id,
+            tool_call_id,
+            event_stream,
+            None,
+            cancellation_rx,
+            Rc::new(RefCell::new(ThreadSandboxGrants::default())),
+            Some(cx.weak_entity()),
+        );
+        tool_event_stream.update_fields(|update| update.status(acp_v2::ToolCallStatus::InProgress));
+        let task = tool.clone().run(
+            ToolInput::ready(input),
+            tool_event_stream.clone(),
+            cx,
+        );
+        Some(ExternalToolRun {
+            tool,
+            stream: tool_event_stream,
+            events: events_rx,
+            cancellation_tx,
+            task,
+        })
+    }
+
     pub(crate) fn register_running_subagent(&mut self, subagent: WeakEntity<Thread>) {
         self.running_subagents.push(subagent);
     }
@@ -5595,6 +5659,67 @@ pub struct Erased<T>(T);
 pub struct AgentToolOutput {
     pub llm_output: Vec<LanguageModelToolResultContent>,
     pub raw_output: serde_json::Value,
+}
+
+/// A tool run started through [`Thread::run_external_tool`] that is not part
+/// of a model turn.
+///
+/// The caller must pump `events` (and, critically, answer every
+/// [`ThreadEvent::ToolCallAuthorization`] via [`ToolCallEventStream::resolve_authorization`]
+/// or the run will never complete), then await `task` for the tool's output.
+pub struct ExternalToolRun {
+    /// The tool being run.
+    pub tool: Arc<dyn AnyAgentTool>,
+    /// The tool's event stream. Used to answer authorization requests.
+    pub stream: ToolCallEventStream,
+    /// Events emitted by the tool run.
+    pub events: mpsc::UnboundedReceiver<Result<ThreadEvent>>,
+    cancellation_tx: watch::Sender<bool>,
+    /// The in-flight tool run.
+    pub task: Task<Result<AgentToolOutput, AgentToolOutput>>,
+}
+
+impl ExternalToolRun {
+    fn from_error(tool: Arc<dyn AnyAgentTool>, message: &'static str) -> Self {
+        let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
+        let event_stream = ThreadEventStream::new(events_tx);
+        let (cancellation_tx, cancellation_rx) = watch::channel(false);
+        let tool_event_stream = ToolCallEventStream::new(
+            LanguageModelToolUseId::from(format!("external:{}", tool.name()).as_str()),
+            acp_v2::ToolCallId::new(format!("0:{}", tool.name())),
+            event_stream,
+            None,
+            cancellation_rx,
+            Rc::new(RefCell::new(ThreadSandboxGrants::default())),
+            None,
+        );
+        Self {
+            tool,
+            stream: tool_event_stream,
+            events: events_rx,
+            cancellation_tx,
+            task: Task::ready(Err(anyhow!(message).into())),
+        }
+    }
+
+    /// Request cancellation of the tool run. Tools observe this via
+    /// `ToolCallEventStream::cancelled_by_user` and finish promptly.
+    pub fn cancel(&mut self) {
+        self.cancellation_tx.send(true).ok();
+    }
+
+    /// Consumes the run, yielding the pieces needed to pump it independently:
+    /// the in-flight task, its event receiver, and the cancellation sender
+    /// (send `true` to request cancellation).
+    pub fn into_parts(
+        self,
+    ) -> (
+        Task<Result<AgentToolOutput, AgentToolOutput>>,
+        mpsc::UnboundedReceiver<Result<ThreadEvent>>,
+        watch::Sender<bool>,
+    ) {
+        (self.task, self.events, self.cancellation_tx)
+    }
 }
 
 impl From<anyhow::Error> for AgentToolOutput {
@@ -10467,5 +10592,217 @@ mod tests {
             );
             assert!(last_message.tool_results.contains_key(&tool_use_id));
         })
+    }
+    struct FailingThreadEnvironment;
+
+    impl ThreadEnvironment for FailingThreadEnvironment {
+        fn create_terminal(
+            &self,
+            _command: String,
+            _extra_env: Vec<(String, String)>,
+            _cwd: Option<std::path::PathBuf>,
+            _output_byte_limit: Option<u64>,
+            _sandbox_wrap: Option<acp_thread::SandboxWrap>,
+            _cx: &mut AsyncApp,
+        ) -> Task<Result<Rc<dyn TerminalHandle>>> {
+            Task::ready(Err(anyhow!("terminals are not available in this environment")))
+        }
+
+        fn create_subagent(
+            &self,
+            _label: String,
+            _model: Option<AgentModelId>,
+            _cx: &mut App,
+        ) -> Result<Rc<dyn SubagentHandle>> {
+            Err(anyhow!("subagents are not available in this environment"))
+        }
+    }
+
+    async fn external_tool_thread(
+        cx: &mut TestAppContext,
+        initial_tree: serde_json::Value,
+    ) -> Entity<Thread> {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", initial_tree).await;
+        let project = Project::test(fs, [std::path::Path::new("/root")], cx).await;
+        let context_server_registry =
+            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
+        let model = cx.update(|cx| LanguageModelRegistry::test(cx).model("fake"));
+        let thread = cx.new(|cx| {
+            Thread::new(
+                project,
+                cx.new(|_cx| ProjectContext::default()),
+                context_server_registry,
+                Templates::new(),
+                Some(model),
+                cx,
+            )
+        });
+        thread.update(cx, |thread, cx| {
+            thread.add_default_tools(Rc::new(FailingThreadEnvironment), cx)
+        });
+        thread
+    }
+
+    fn allow_all_tool_permissions(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_run_external_tool_edit_file_with_allow_rule(cx: &mut TestAppContext) {
+        let thread = external_tool_thread(
+            cx,
+            serde_json::json!({ "file.txt": "line 1\nline 2\n" }),
+        )
+        .await;
+        allow_all_tool_permissions(cx);
+
+        let mut run = thread.update(cx, |thread, cx| {
+            thread.run_external_tool(
+                "edit_file",
+                json!({
+                    "path": "root/file.txt",
+                    "edits": [{ "old_text": "line 2", "new_text": "modified line 2" }]
+                }),
+                cx,
+            )
+        })
+        .expect("edit_file is a registered tool");
+
+        let Ok(output) = run.task.await else {
+            panic!("expected successful tool run");
+        };
+        let output_text = output
+            .llm_output
+            .iter()
+            .map(|part| match part {
+                LanguageModelToolResultContent::Text(text) => text.to_string(),
+                _ => String::new(),
+            })
+            .collect::<String>();
+        assert!(
+            output_text.contains("Edited"),
+            "unexpected output: {output_text}"
+        );
+        let fs = thread.update(cx, |thread, cx| thread.project().read(cx).fs().clone());
+        let contents = fs.load(std::path::Path::new("/root/file.txt")).await.unwrap();
+        assert_eq!(contents, "line 1\nmodified line 2\n");
+    }
+
+    #[gpui::test]
+    async fn test_run_external_tool_respects_permission_rules(cx: &mut TestAppContext) {
+        let thread = external_tool_thread(
+            cx,
+            serde_json::json!({
+                "file.txt": "line 1\n",
+                ".zed": { "settings.json": "{}\n" }
+            }),
+        )
+        .await;
+
+        // A `deny` tool permission rule rejects the run with a tool error,
+        // without any prompt, and without touching the file.
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings
+                .tool_permissions
+                .tools
+                .insert(
+                    "edit_file".into(),
+                    agent_settings::ToolRules {
+                        default: Some(settings::ToolPermissionMode::Deny),
+                        ..Default::default()
+                    },
+                );
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        let run = thread.update(cx, |thread, cx| {
+            thread
+                .run_external_tool(
+                    "edit_file",
+                    json!({
+                        "path": "root/file.txt",
+                        "edits": [{ "old_text": "line 1", "new_text": "changed" }]
+                    }),
+                    cx,
+                )
+                .expect("edit_file is a registered tool")
+        });
+        assert!(
+            run.task.await.is_err(),
+            "denied tool run must surface a tool error"
+        );
+        let fs = thread.update(cx, |thread, cx| thread.project().read(cx).fs().clone());
+        let contents = fs.load(std::path::Path::new("/root/file.txt")).await.unwrap();
+        assert_eq!(contents, "line 1\n");
+
+        // Default settings let in-project edits pass without a prompt, but
+        // a sensitive path (project-local `.zed/settings.json`) prompts:
+        // the caller owns the decision and denies it.
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.tools.clear();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        let mut run = thread.update(cx, |thread, cx| {
+            thread
+                .run_external_tool(
+                    "edit_file",
+                    json!({
+                        "path": "root/.zed/settings.json",
+                        "edits": [{ "old_text": "{}", "new_text": "{}\n" }]
+                    }),
+                    cx,
+                )
+                .expect("edit_file is a registered tool")
+        });
+        let auth = loop {
+            let event = run
+                .events
+                .next()
+                .await
+                .expect("authorization event exists")
+                .expect("event ok");
+            if let ThreadEvent::ToolCallAuthorization(auth) = event {
+                break auth;
+            }
+        };
+        let deny = auth
+            .options
+            .first_option_of_kind(acp_v2::PermissionOptionKind::RejectOnce)
+            .expect("reject option exists");
+        assert!(
+            auth.response
+                .send(acp_thread::SelectedPermissionOutcome::new(
+                    deny.option_id.clone(),
+                    deny.kind.clone(),
+                ))
+                .is_ok()
+        );
+        assert!(
+            run.task.await.is_err(),
+            "denied confirmation must surface a tool error"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_run_external_tool_unknown_tool_returns_none(cx: &mut TestAppContext) {
+        let thread = external_tool_thread(cx, serde_json::json!({ "empty": "" })).await;
+        thread.update(cx, |thread, cx| {
+            assert!(thread
+                .run_external_tool("not_a_tool", serde_json::Value::Null, cx)
+                .is_none());
+            assert!(thread.registered_tool("edit_file").is_some());
+            assert!(thread.registered_tools().iter().any(|tool| tool.name() == "edit_file"));
+        });
     }
 }

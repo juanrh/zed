@@ -251,6 +251,24 @@ pub struct AgentSettings {
     pub auto_generate_thread_titles: bool,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
+    pub editor_mcp_server: EditorMcpServerSettings,
+}
+
+#[derive(Clone, Debug)]
+pub struct EditorMcpServerSettings {
+    /// Whether to start the in-editor MCP server for each workspace.
+    pub enabled: bool,
+    /// Names of built-in agent tools served over MCP.
+    pub tools: Vec<String>,
+}
+
+impl Default for EditorMcpServerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tools: vec!["edit_file".to_string()],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -848,7 +866,23 @@ impl Settings for AgentSettings {
             auto_generate_thread_titles: agent.auto_generate_thread_titles.unwrap(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
+            editor_mcp_server: compile_editor_mcp_server(agent.editor_mcp_server),
         }
+    }
+}
+
+fn compile_editor_mcp_server(
+    content: Option<settings::EditorMcpServerContent>,
+) -> EditorMcpServerSettings {
+    let Some(content) = content else {
+        return EditorMcpServerSettings::default();
+    };
+    EditorMcpServerSettings {
+        enabled: content.enabled.unwrap_or(false),
+        tools: content
+            .tools
+            .map(|tools| tools.iter().map(|tool| tool.to_string()).collect())
+            .unwrap_or_else(|| EditorMcpServerSettings::default().tools),
     }
 }
 
@@ -1452,6 +1486,37 @@ mod tests {
         let permissions = compile_tool_permissions(None);
         assert!(permissions.tools.is_empty());
         assert_eq!(permissions.default, ToolPermissionMode::Confirm);
+    }
+
+    #[test]
+    fn test_editor_mcp_server_defaults() {
+        let settings = compile_editor_mcp_server(None);
+        assert!(!settings.enabled);
+        assert_eq!(settings.tools, vec!["edit_file".to_string()]);
+    }
+
+    #[test]
+    fn test_editor_mcp_server_parsing() {
+        let content: settings::EditorMcpServerContent = serde_json::from_value(json!({
+            "enabled": true,
+            "tools": ["edit_file", "read_file"]
+        }))
+        .unwrap();
+        let settings = compile_editor_mcp_server(Some(content));
+        assert!(settings.enabled);
+        assert_eq!(
+            settings.tools,
+            vec!["edit_file".to_string(), "read_file".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_editor_mcp_server_partial_content() {
+        let content: settings::EditorMcpServerContent =
+            serde_json::from_value(json!({ "enabled": true })).unwrap();
+        let settings = compile_editor_mcp_server(Some(content));
+        assert!(settings.enabled);
+        assert_eq!(settings.tools, vec!["edit_file".to_string()]);
     }
 
     #[test]

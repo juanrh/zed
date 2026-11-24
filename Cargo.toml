@@ -64,6 +64,7 @@ members = [
     "crates/edit_prediction_types",
     "crates/edit_prediction_ui",
     "crates/editor",
+    "crates/editor_mcp",
     "crates/editor_benchmarks",
     "crates/encoding_selector",
     "crates/env_var",
@@ -246,6 +247,7 @@ members = [
     "crates/x_ai",
     "crates/x_ai_subscribed",
     "crates/zed",
+    "crates/zed-editor-mcp",
     "crates/zed_actions",
     "crates/zed_credentials_provider",
     "crates/zed_env_vars",
@@ -446,6 +448,7 @@ picker_preview = { path = "crates/picker_preview" }
 platform_title_bar = { path = "crates/platform_title_bar" }
 prettier = { path = "crates/prettier" }
 project = { path = "crates/project" }
+editor_mcp = { path = "crates/editor_mcp" }
 project_panel = { path = "crates/project_panel" }
 project_symbols = { path = "crates/project_symbols" }
 project_bookmarks = { path = "crates/project_bookmarks" }
