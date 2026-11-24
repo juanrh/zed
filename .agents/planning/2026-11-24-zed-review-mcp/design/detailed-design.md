@@ -311,3 +311,79 @@ CI surface: `cargo test -p zed_review_mcp`, `cargo clippy -p zed_review_mcp --al
    with Zed's review UI; rejected.
 3. **Read-only editor-context tools first** (choen Patchbay-style): useful but not the
    named flagship use case; only `open_paths` kept in MVP as the minimal IDE tie-in.
+
+---
+
+# Revision 2 — the agent tool bridge (primary architecture)
+
+Raised in review: instead of re-implementing an Aletheia-style baseline protocol inside
+zed, expose the Zed agent's own tools so external agents reuse the exact same code paths
+— including `edit_file`'s pending-edit review diff. Investigation conclusions
+(`research/agent-tool-bridge.md`):
+
+- The agent's tools are in-app `AgentTool` implementations bound to the live
+  `Project`/`Thread` entity graph, so extracting them into a shared `gpui`-free library
+  is a core re-architecture, not a refactor. But in-process reuse needs no extraction at
+  all: the running Zed can construct the agent's own tool objects
+  (`GrepTool::new(project)`, `EditFileTool::new(project, thread, …)`) and `run` them.
+
+## R2 architecture
+
+```mermaid
+flowchart LR
+    AgentHost["agent host (Vibe CLI, Claude Code, ...)"]
+    subgraph M["zed-review-mcp (headless, this crate, fully tested)"]
+        MCP["MCP server (rmcp)"]
+        Gateway["gateway tools: edit_file, grep, diagnostics (schema parity with the agent tools)"]
+        BridgeClient["AgentBridgeClient (JSON-RPC over Unix domain socket)"]
+        Offline["offline review tools (record_baseline, open_review, ...) — fallback"]
+    end
+    subgraph Z["running Zed (app crates; needs a GUI build to develop)"]
+        Listener["loopback tool listener (new, ~300-500 lines, pattern: listen_for_cli_connections)"]
+        Tools["the agent's own AgentTool instances (crates/agent/src/tools/*)"]
+        Panel["agent panel: pending-edit diff review"]
+    end
+    AgentHost -- "tools/call" --> MCP --> Gateway
+    Gateway -- "tool/run {tool, input}" --> BridgeClient ---- Listener
+    Listener --> Tools --> Panel
+    User --- Panel
+```
+
+- **Wire protocol**: newline-delimited JSON-RPC 2.0 over a Unix domain socket at
+  `ZED_AGENT_BRIDGE_SOCKET` (env; default `<paths::data_dir()>/zed-agent-tool-bridge.sock`,
+  portability via named pipes on Windows deferred). Method `agent_tool/run` with
+  `{"tool": "<AgentTool::NAME>", "input": <tool input JSON>}`; result renders the tool
+  output as MCP-style content `{"content":[{"type":"text","text":...}]}`; errors are
+  JSON-RPC errors that the gateway surfaces as MCP `isError` text naming the tool.
+- **Schema parity**: each gateway tool mirrors the agent tool's `Input` struct
+  (same field names, same schema doc-comments, schemars-derived), so agents already
+  trained on Zed's tool list need no changes.
+- **Session semantics**: the app-side listener binds a bridge session to the active
+  workspace/project; `edit_file` pending edits land in the agent panel exactly like the
+  built-in agent's edits, giving the identical rich-diff review (review → edit →
+  approve/reject) with CI run against real files — the reviewer's requested behavior.
+- **Offline fallback**: the v1 baseline-review tools (record_baseline / edit /
+  open_review / approve / reject / open_paths / get_change_status) remain for
+  conversations where Zed is not running or the app bridge has not landed; the server
+  README and tool descriptions present them as fallback, not the primary flow.
+- **App-side piece**: new module in `crates/zed` following `listen_for_cli_connections`
+  (`open_listener.rs:417`): Unix-socket accept loop, one request at a time; resolve the
+  active workspace → `Project`/`Thread`; dispatch `tool` via the registry in
+  `crates/agent/src/tools.rs` (`ALL_TOOL_NAMES`); construct the tool (matching
+  `EditFileTool`'s thread+permission-agent wiring in `thread.rs`); run
+  `AgentTool::run`; serialize `Self::Output` (it is `Serialize`, and its MCP content
+  text is what the gateway returns). Permission-gated tools route through the same
+  `ToolPermissionsAgent` the agent panel uses, confirming each call in the panel UI.
+
+## R2 value and phasing
+
+Phasing from the research matrix: (1) this PR — headless protocol + gateway
+(`grep`, `diagnostics`, plus `edit_file`/`read_file`/`write_file`-family contracts) with
+full protocol tests against a fake bridge; (2) the app-side listener + bridge session on
+a machine that can build the app crates (this environment cannot compile
+`gpui`-dependent crates; verified and documented, cf. PR #1); (3) remaining tools by
+phase (terminal, LSP tools, conversation tools — see the research matrix for per-tool
+effort).
+
+Everything in (2) is mechanical against the protocol and tool registry; no editor-domain
+decisions remain open except the permission-confirmation UX for external callers.
