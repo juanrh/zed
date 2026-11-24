@@ -4,7 +4,7 @@
 
 - [x] Step 1: Settings plumbing for `agent.editor_mcp_server`
 - [x] Step 2: `agent` crate out-of-turn tool-run API on `Thread`
-- [ ] Step 3: MCP protocol module for `editor_mcp` (pure, unit-tested)
+- [x] Step 3: MCP protocol module for `editor_mcp` (pure, unit-tested)
 - [ ] Step 4: `editor_mcp` dispatch core (tool registry view + pump)
 - [ ] Step 5: `editor_mcp` socket server + proxy crate
 - [ ] Step 6: workspace wiring + README
@@ -212,3 +212,16 @@ Tests: 3 new `#[gpui::test]`s in `agent` (allow edit — file changed +
 `Edited ...` text; deny rule — tool error, file untouched; sensitive-path
 confirmation → deny → tool error; unknown tool → None). Full `agent` lib
 suite: 821 passed, 0 failed.
+
+## Implementation notes — Step 3
+
+Done: `crates/editor_mcp` crate (workspace member; deps limited to
+agent/agent_settings/gpui/project/prompt_store + std-level crates) and the
+pure `protocol` module: `parse_message` producing `Message::{Request,
+Notification, UnknownMethod, Invalid}`, builders for
+initialize/ping/tools-list/tools-call/error responses, and a `ToolCallOutcome`
+type mapping tool output to MCP `isError` semantics. One addition the plan
+didn't name: `Action::CallToolError` for `tools/call` frames that miss the
+tool name — keeps protocol handling total and answers with a tool-result
+error, like the built-in agent answers bad input. All 8 protocol unit tests
+pass. No deviations otherwise.
