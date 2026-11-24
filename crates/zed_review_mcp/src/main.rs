@@ -73,7 +73,8 @@ fn resolve_session_directory(arguments: impl Iterator<Item = String>) -> Result<
         let unexpected_remainder = arguments.iter().skip(index + 2).next();
         anyhow::ensure!(
             unexpected_remainder.is_none(),
-            "unexpected argument: {unexpected_remainder:?}\n\n{USAGE}"
+            "unexpected argument: {}\n\n{USAGE}",
+            unexpected_remainder.map(String::as_str).unwrap_or_default()
         );
         return Ok((PathBuf::from(directory), false));
     }
