@@ -2,7 +2,7 @@
 
 ## Checklist
 
-- [ ] Step 1: Settings plumbing for `agent.editor_mcp_server`
+- [x] Step 1: Settings plumbing for `agent.editor_mcp_server`
 - [ ] Step 2: `agent` crate out-of-turn tool-run API on `Thread`
 - [ ] Step 3: MCP protocol module for `editor_mcp` (pure, unit-tested)
 - [ ] Step 4: `editor_mcp` dispatch core (tool registry view + pump)
@@ -174,3 +174,14 @@ before the round closes.
 
 **Demo:** review verdict "Ship" (or 3 rounds exhausted with all findings
 incorporated), recorded in `reviews/`.
+
+## Implementation notes — Step 1
+
+Settings plumbing done: `EditorMcpServerContent { enabled, tools }` in
+`crates/settings_content/src/agent.rs` (needed `MergeFrom`/`PartialEq` derives
+to satisfy the settings machinery — same as sibling content structs), field on
+`AgentSettingsContent`, compiled `EditorMcpServerSettings` +
+`compile_editor_mcp_server` in `crates/agent_settings` (defaults:
+`enabled=false`, `tools=["edit_file"]`), and three unit tests
+(`test_editor_mcp_server_{defaults,parsing,partial_content}`).
+No deviations from the plan. `cargo test -p agent_settings --lib`: 47 passed.

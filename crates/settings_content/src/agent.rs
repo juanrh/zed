@@ -416,6 +416,24 @@ pub struct AgentSettingsContent {
     /// These are populated when choosing "Allow always" from a sandbox
     /// escalation prompt.
     pub sandbox_permissions: Option<SandboxPermissionsContent>,
+
+    /// The in-editor MCP server that exposes built-in agent tools (such as
+    /// `edit_file`) to external MCP clients over a per-workspace local
+    /// socket.
+    pub editor_mcp_server: Option<EditorMcpServerContent>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct EditorMcpServerContent {
+    /// Whether to start the in-editor MCP server for each workspace.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// Names of built-in agent tools served over MCP. Tool-call permission
+    /// rules (`agent.tool_permissions`) still apply to every call.
+    ///
+    /// Default: ["edit_file"]
+    pub tools: Option<Vec<Arc<str>>>,
 }
 
 impl AgentSettingsContent {
