@@ -1,13 +1,13 @@
+mod common;
+
 use anyhow::{Context as _, Result};
+use common::{FakeZed, TestProject};
 use serde_json::{Value, json};
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
-use zed_review_mcp::ReviewStore;
 use zed_review_mcp::review_server::ReviewServer;
 
-const TIMEOUT: Duration = Duration::from_secs(20);
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 struct RawMcpClient {
     reader: BufReader<ReadHalf<DuplexStream>>,
@@ -129,50 +129,19 @@ struct ToolOutcome {
     text: String,
 }
 
-struct TestProject {
-    _project_dir: tempfile::TempDir,
-    _session_dir: tempfile::TempDir,
-    root: PathBuf,
-}
-
-impl TestProject {
-    fn new() -> Self {
-        let project_dir = tempfile::TempDir::new().unwrap();
-        let session_dir = tempfile::TempDir::new().unwrap();
-        Self {
-            root: project_dir.path().canonicalize().unwrap(),
-            _project_dir: project_dir,
-            _session_dir: session_dir,
-        }
-    }
-
-    fn store(&self) -> ReviewStore {
-        ReviewStore::start(&self.root, self._session_dir.path()).unwrap()
-    }
-
-    fn write_relative(&self, relative: &str, contents: &str) -> PathBuf {
-        let path = self.root.join(relative);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, contents).unwrap();
-        path
-    }
-}
-
-async fn start_server(project: &TestProject) -> Result<RawMcpClient> {
+async fn start_server(project: &TestProject, fake_zed: &FakeZed) -> Result<RawMcpClient> {
     let review_store = Arc::new(project.store());
     let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
-    let server_task = tokio::spawn(async move {
-        let server = ReviewServer::new(review_store);
+    let zed_opener = Arc::new(fake_zed.opener());
+    tokio::spawn(async move {
+        let server = ReviewServer::new(review_store, zed_opener);
         use rmcp::ServiceExt;
         match server.serve(server_stream).await {
             Ok(service) => {
                 let _ = service.waiting().await;
             }
-            Err(error) => eprintln!("serve error in test: {error:?}"),
+            Err(error) => eprintln!("serve failed inside test: {error:?}"),
         }
-    });
-    tokio::spawn(async move {
-        let _ = server_task.await;
     });
     let mut client = RawMcpClient::new(client_stream);
     client.initialize().await?;
@@ -180,9 +149,10 @@ async fn start_server(project: &TestProject) -> Result<RawMcpClient> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_metadata_lists_review_tools_with_schemas() {
+async fn test_metadata_lists_review_tools_with_descriptions() {
     let project = TestProject::new();
-    let mut client = start_server(&project).await.unwrap();
+    let fake_zed = FakeZed::new();
+    let mut client = start_server(&project, &fake_zed).await.unwrap();
     let tools = client.list_tools().await.unwrap();
     let mut names = tools
         .iter()
@@ -191,16 +161,20 @@ async fn test_metadata_lists_review_tools_with_schemas() {
     names.sort();
     assert_eq!(
         names,
-        vec!["approve", "get_change_status", "record_baseline", "reject"]
+        vec![
+            "approve",
+            "edit",
+            "get_change_status",
+            "open_paths",
+            "open_review",
+            "record_baseline",
+            "reject",
+        ]
     );
     for tool in &tools {
         assert!(
-            tool["inputSchema"]["properties"]
-                .as_object()
-                .or(tool["inputSchema"].as_object())
-                .is_some()
-                || tool["description"].as_str().is_some(),
-            "tool must carry a schema or description: {tool}"
+            tool["description"].as_str().is_some_and(|d| !d.is_empty()),
+            "every tool must document itself for the agent: {tool}"
         );
     }
 }
@@ -208,7 +182,8 @@ async fn test_metadata_lists_review_tools_with_schemas() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_review_round_trip_over_protocol() {
     let project = TestProject::new();
-    let mut client = start_server(&project).await.unwrap();
+    let fake_zed = FakeZed::new();
+    let mut client = start_server(&project, &fake_zed).await.unwrap();
 
     let code_path = project.write_relative("src/hello.py", "print('original')\n");
     let new_file_path = project.root.join("src/generated.py");
@@ -299,9 +274,165 @@ async fn test_review_round_trip_over_protocol() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_edit_tool_registers_baseline_and_open_review_spawns_zed_diff() {
+    let project = TestProject::new();
+    let fake_zed = FakeZed::new();
+    let mut client = start_server(&project, &fake_zed).await.unwrap();
+
+    let code_path = project.write_relative("hello.py", "value = 1\n");
+
+    let outcome = client
+        .call_tool(
+            "edit",
+            json!({
+                "file_path": code_path.to_string_lossy(),
+                "old_string": "value = 1",
+                "new_string": "value = 2",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!outcome.is_error, "edit failed: {}", outcome.text);
+    assert!(
+        outcome.text.contains("baseline registered"),
+        "{}",
+        outcome.text
+    );
+    assert_eq!(std::fs::read_to_string(&code_path).unwrap(), "value = 2\n");
+
+    let outcome = client
+        .call_tool(
+            "edit",
+            json!({
+                "file_path": code_path.to_string_lossy(),
+                "old_string": "value = 2",
+                "new_string": "value = 3",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!outcome.is_error, "second edit failed: {}", outcome.text);
+    assert!(
+        !outcome.text.contains("baseline registered"),
+        "the baseline must not be re-anchored: {}",
+        outcome.text
+    );
+    assert_eq!(std::fs::read_to_string(&code_path).unwrap(), "value = 3\n");
+
+    let outcome = client.call_tool("open_review", json!({})).await.unwrap();
+    assert!(!outcome.is_error, "open_review failed: {}", outcome.text);
+    assert!(
+        outcome.text.contains("1 changed file(s)"),
+        "{}",
+        outcome.text
+    );
+    fake_zed.wait_for_invocation();
+    let invocations = fake_zed.recorded_invocations();
+    assert_eq!(invocations.len(), 1, "{invocations:?}");
+    assert!(invocations[0].starts_with("--diff "), "{invocations:?}");
+    assert!(
+        invocations[0].ends_with(project.root.to_string_lossy().as_ref()),
+        "the right side of the diff must be the project root: {invocations:?}"
+    );
+
+    let outcome = client
+        .call_tool(
+            "open_paths",
+            json!({"paths": [code_path.to_string_lossy()]}),
+        )
+        .await
+        .unwrap();
+    assert!(!outcome.is_error, "open_paths failed: {}", outcome.text);
+    fake_zed.wait_for_invocation_count(2);
+    let invocations = fake_zed.recorded_invocations();
+    assert_eq!(invocations.len(), 2, "{invocations:?}");
+    assert_eq!(
+        invocations[1],
+        code_path.to_string_lossy().to_string(),
+        "{invocations:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_edit_tool_error_cases_leave_no_baseline() {
+    let project = TestProject::new();
+    let fake_zed = FakeZed::new();
+    let mut client = start_server(&project, &fake_zed).await.unwrap();
+
+    let code_path = project.write_relative("poem.txt", "roses\n");
+
+    let not_found = client
+        .call_tool(
+            "edit",
+            json!({
+                "file_path": code_path.to_string_lossy(),
+                "old_string": "violets",
+                "new_string": "daisies",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(not_found.is_error, "{}", not_found.text);
+    assert!(not_found.text.contains("not found"), "{}", not_found.text);
+
+    let ambiguous_source = project.write_relative("repeated.txt", "da\nda\nda\n");
+    let ambiguous = client
+        .call_tool(
+            "edit",
+            json!({
+                "file_path": ambiguous_source.to_string_lossy(),
+                "old_string": "da",
+                "new_string": "di",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(ambiguous.is_error, "{}", ambiguous.text);
+    assert!(ambiguous.text.contains("3 times"), "{}", ambiguous.text);
+
+    let identical = client
+        .call_tool(
+            "edit",
+            json!({
+                "file_path": code_path.to_string_lossy(),
+                "old_string": "roses",
+                "new_string": "roses",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(identical.is_error, "{}", identical.text);
+
+    let outcome = client
+        .call_tool("get_change_status", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        outcome.text.contains("no files are under review"),
+        "failed edits must leave no baseline side effects: {}",
+        outcome.text
+    );
+
+    let outcome = client
+        .call_tool(
+            "edit",
+            json!({
+                "file_path": code_path.to_string_lossy(),
+                "old_string": "roses",
+                "new_string": "violets",
+                "replace_all": true,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!outcome.is_error, "{}", outcome.text);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_decide_all_over_protocol() {
     let project = TestProject::new();
-    let mut client = start_server(&project).await.unwrap();
+    let fake_zed = FakeZed::new();
+    let mut client = start_server(&project, &fake_zed).await.unwrap();
     let first_path = project.write_relative("one.txt", "1\n");
     let second_path = project.write_relative("two.txt", "2\n");
     client
@@ -340,7 +471,8 @@ async fn test_decide_all_over_protocol() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tool_errors_report_is_error_with_offending_path() {
     let project = TestProject::new();
-    let mut client = start_server(&project).await.unwrap();
+    let fake_zed = FakeZed::new();
+    let mut client = start_server(&project, &fake_zed).await.unwrap();
     let code_path = project.write_relative("hello.py", "print('hi')\n");
 
     let outcome = client

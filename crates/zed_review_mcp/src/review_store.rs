@@ -235,6 +235,46 @@ impl ReviewStore {
         Ok(outcome)
     }
 
+    pub fn has_baseline(&self, path: &Path) -> Result<bool> {
+        Ok(self.baseline_path(path)?.exists())
+    }
+
+    pub fn materialize_review_view(&self) -> Result<(PathBuf, Vec<FileStatus>)> {
+        let review_view_dir = self.session_dir.join("review-view");
+        if review_view_dir.exists() {
+            fs::remove_dir_all(&review_view_dir)
+                .with_context(|| format!("clearing {}", review_view_dir.display()))?;
+        }
+        fs::create_dir_all(&review_view_dir)
+            .with_context(|| format!("creating {}", review_view_dir.display()))?;
+
+        let statuses = self.status()?;
+        let mut changed_statuses = Vec::new();
+        for file_status in &statuses {
+            if file_status.kind == FileKind::Unchanged {
+                continue;
+            }
+            let baseline_path = self.baselines_dir.join(&file_status.path);
+            let view_path = review_view_dir.join(&file_status.path);
+            if let Some(parent) = view_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            fs::copy(&baseline_path, &view_path).with_context(|| {
+                format!(
+                    "copying {} to {}",
+                    baseline_path.display(),
+                    view_path.display()
+                )
+            })?;
+            changed_statuses.push(FileStatus {
+                path: file_status.path.clone(),
+                kind: file_status.kind,
+            });
+        }
+        Ok((review_view_dir, changed_statuses))
+    }
+
     fn reviewed_baseline_paths(&self) -> Result<Vec<(PathBuf, PathBuf)>> {
         let mut reviewed = Vec::new();
         let mut stack = vec![self.baselines_dir.clone()];
@@ -550,7 +590,10 @@ mod tests {
             vec![("whole_new_file.py".into(), FileKind::Created)]
         );
 
-        fixture.store.approve_paths(std::slice::from_ref(&path)).unwrap();
+        fixture
+            .store
+            .approve_paths(std::slice::from_ref(&path))
+            .unwrap();
         assert!(fixture.store.status().unwrap().is_empty());
         assert!(path.is_file());
     }
@@ -657,7 +700,10 @@ mod tests {
         fixture.store.record_baseline(&path).unwrap();
         fixture.write("src/main.py", "print('proposed')\n");
 
-        fixture.store.reject_paths(std::slice::from_ref(&path)).unwrap();
+        fixture
+            .store
+            .reject_paths(std::slice::from_ref(&path))
+            .unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "print('original')\n");
         assert!(fixture.store.status().unwrap().is_empty());
@@ -670,7 +716,10 @@ mod tests {
         fixture.store.record_baseline(&path).unwrap();
         fs::remove_dir_all(fixture.root.join("a")).unwrap();
 
-        fixture.store.reject_paths(std::slice::from_ref(&path)).unwrap();
+        fixture
+            .store
+            .reject_paths(std::slice::from_ref(&path))
+            .unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "one\n");
         assert!(fixture.store.status().unwrap().is_empty());
@@ -696,7 +745,10 @@ mod tests {
         fixture.store.record_baseline(&path).unwrap();
         fixture.write("main.py", "b\n");
 
-        fixture.store.approve_paths(std::slice::from_ref(&path)).unwrap();
+        fixture
+            .store
+            .approve_paths(std::slice::from_ref(&path))
+            .unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "b\n");
         assert!(fixture.store.status().unwrap().is_empty());
@@ -722,7 +774,10 @@ mod tests {
         fixture.store.record_baseline(&path).unwrap();
         fixture.write("created_thing.py", "content\n");
 
-        fixture.store.reject_paths(std::slice::from_ref(&path)).unwrap();
+        fixture
+            .store
+            .reject_paths(std::slice::from_ref(&path))
+            .unwrap();
 
         assert!(!path.exists());
         assert!(fixture.store.status().unwrap().is_empty());
@@ -771,7 +826,10 @@ mod tests {
         let fixture = ReviewFixture::new();
         let path = fixture.write("a/b/c.txt", "x");
         fixture.store.record_baseline(&path).unwrap();
-        fixture.store.approve_paths(std::slice::from_ref(&path)).unwrap();
+        fixture
+            .store
+            .approve_paths(std::slice::from_ref(&path))
+            .unwrap();
         assert!(!fixture.store.baselines_dir.join("a/b").exists());
         assert!(!fixture.store.baselines_dir.join("a").exists());
         assert!(fixture.store.baselines_dir.exists());
@@ -805,6 +863,64 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("was started for trusted root"), "{error}");
+    }
+
+    #[test]
+    fn test_materialize_review_view_only_contains_changed_files() {
+        let fixture = ReviewFixture::new();
+        fixture.write(
+            "changed.py",
+            "original
+",
+        );
+        fixture.write(
+            "stale.py",
+            "original
+",
+        );
+        let changed_path = fixture.path("changed.py");
+        fixture.store.record_baseline(&changed_path).unwrap();
+        fixture.write(
+            "changed.py",
+            "changed
+",
+        );
+        let new_file_path = fixture.path("new.py");
+        fixture.store.record_baseline(&new_file_path).unwrap();
+
+        let (_view_dir, changed_statuses) = fixture.store.materialize_review_view().unwrap();
+        assert_eq!(changed_statuses.len(), 2);
+        assert!(
+            changed_statuses
+                .iter()
+                .any(|status| status.path == *"changed.py" && status.kind == FileKind::Modified)
+        );
+        assert!(
+            changed_statuses
+                .iter()
+                .any(|status| status.path == *"new.py" && status.kind == FileKind::Created)
+        );
+
+        let view_dir = fixture.store.session_dir().join("review-view");
+        assert!(view_dir.join("changed.py").is_file());
+        assert!(view_dir.join("new.py").is_file());
+        assert!(!view_dir.join("stale.py").exists());
+        assert_eq!(
+            fs::read_to_string(view_dir.join("changed.py")).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[test]
+    fn test_materialize_review_view_clears_previous_view() {
+        let fixture = ReviewFixture::new();
+        let path = fixture.write("one.py", "a\n");
+        fixture.store.record_baseline(&path).unwrap();
+        let (view_dir, _) = fixture.store.materialize_review_view().unwrap();
+        fs::write(view_dir.join("obsolete.py"), "").unwrap();
+
+        let (view_dir, _) = fixture.store.materialize_review_view().unwrap();
+        assert!(!view_dir.join("obsolete.py").exists());
     }
 
     #[test]

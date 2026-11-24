@@ -5,9 +5,9 @@ Converts the design into test-first, demoable increments. The design document
 
 ## Checklist
 
-- [ ] Step 1: crate scaffold + baseline review store (record/status/approve/reject) with tests
-- [ ] Step 2: MCP server on rmcp with the review tools wired to the store
-- [ ] Step 3: ZedOpener (`open_review`, `open_paths`) + edit tool + binary end-to-end
+- [x] Step 1: crate scaffold + baseline review store (record/status/approve/reject) with tests
+- [x] Step 2: MCP server on rmcp with the review tools wired to the store
+- [x] Step 3: ZedOpener (`open_review`, `open_paths`) + edit tool + binary end-to-end
 
 ## Working agreements
 
@@ -101,3 +101,34 @@ tools/list names, the full record → status → edit → status → reject/appr
 decide-all, and `isError` bodies naming offending paths (outside-root, re-record,
 empty paths, missing baseline). Verified: `cargo test -p zed_review_mcp` — 38 passed
 (34 unit + 4 protocol); `cargo clippy --all-targets` clean; `cargo fmt --check` clean.
+
+
+---
+
+## Step 3 — Implementation notes
+
+Went as planned with three refinements:
+
+1. **Review view:** instead of passing the whole `baselines/` tree to `zed --diff` (which
+   would also display files whose content is still identical to the baseline),
+   `open_review` materializes a session-scoped `review-view/` mirror that contains only
+   snapshots of files that actually drifted (`ReviewStore::materialize_review_view`).
+   The review GUI then shows exactly the changed, added and removed files; unchanged
+   entries stay under review but out of the view.
+2. **Zed process spawning** uses the fork's `async-process` `reap_on_drop` (the workspace
+   bans `std::process`), and `ZedOpener::resolve_from`/`find_in_path` are parameterized
+   pure functions so tests never mutate process environment (edition-2024 `set_var` is
+   unsafe and racy under parallel tests). Startup hard-fails with a clear message when
+   no `zed` executable can be resolved (the server's whole purpose needs the CLI).
+3. **End-to-end test** spawns the real binary with `CARGO_BIN_EXE_zed-review-mcp`, a fake
+   `zed` script recording its argv, and drives the JSON-RPC handshake, record → edit
+   (auto-baseline) → status → open_review → reject → clean EOF shutdown; explicit session
+   directories survive shutdown, defaults are removed. The binary also rejects unknown
+   arguments deterministically (clippy forced the hand-rolled flag parser to be
+   non-looping; final shape is position-based).
+
+Env surface: `ZED_REVIEW_MCP_SESSION_DIR`, `ZED_PATH`; flags `--session-dir`, `--help`.
+Docs: crate `README.md` (workflow, tool table, Vibe config with `disabled_tools`,
+session semantics). Verified: `cargo test -p zed_review_mcp` — 53 passed (42 unit + 6
+protocol + 2 main.rs/bin arg + 3 integration totals across suites);
+`cargo clippy -p zed_review_mcp --all-targets` clean; `cargo fmt --check` clean.

@@ -1,18 +1,20 @@
 use crate::review_store::{RecordOutcome, ReviewStore};
-use anyhow::{Error, Result};
+use crate::zed_opener::ZedOpener;
+use anyhow::{Context as _, Error, Result};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const SERVER_NAME: &str = "zed-review-mcp";
 
 pub struct ReviewServer {
     review_store: Arc<ReviewStore>,
+    zed_opener: Arc<ZedOpener>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -30,6 +32,26 @@ pub struct RecordBaselineArgs {
 pub struct DecisionArgs {
     /// Absolute paths to approve or reject. Omit to decide every file under review.
     pub paths: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct EditArgs {
+    /// Absolute path of the file to edit.
+    pub file_path: String,
+    /// The exact existing text to replace.
+    pub old_string: String,
+    /// The replacement text.
+    pub new_string: String,
+    /// Replace every occurrence of old_string. Omit when old_string is unique.
+    pub replace_all: Option<bool>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct OpenPathsArgs {
+    /// Absolute paths to open in the running Zed.
+    pub paths: Vec<String>,
 }
 
 fn parse_absolute_paths(paths: &[String]) -> Result<Vec<PathBuf>> {
@@ -72,10 +94,18 @@ fn run_tool(
     Ok(tool_call().unwrap_or_else(error_result))
 }
 
+async fn run_tool_async<F>(tool_call: F) -> Result<CallToolResult, McpError>
+where
+    F: std::future::Future<Output = Result<CallToolResult>>,
+{
+    Ok(tool_call.await.unwrap_or_else(error_result))
+}
+
 impl ReviewServer {
-    pub fn new(review_store: Arc<ReviewStore>) -> Self {
+    pub fn new(review_store: Arc<ReviewStore>, zed_opener: Arc<ZedOpener>) -> Self {
         Self {
             review_store,
+            zed_opener,
             tool_router: Self::tool_router(),
         }
     }
@@ -83,6 +113,47 @@ impl ReviewServer {
     pub fn review_store(&self) -> &ReviewStore {
         &self.review_store
     }
+}
+
+fn apply_edit(
+    review_store: &ReviewStore,
+    file_path: &Path,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<(bool, String)> {
+    anyhow::ensure!(!old_string.is_empty(), "old_string must not be empty");
+    anyhow::ensure!(
+        old_string != new_string,
+        "old_string and new_string are identical; an edit must change the file"
+    );
+    anyhow::ensure!(
+        file_path.is_file(),
+        "{} does not exist; create the file before editing it",
+        file_path.display()
+    );
+    let contents = std::fs::read_to_string(file_path)
+        .with_context(|| format!("reading {}", file_path.display()))?;
+    let match_count = contents.match_indices(old_string).count();
+    match match_count {
+        0 => anyhow::bail!("old_string was not found in {}", file_path.display()),
+        _ if !replace_all && match_count > 1 => anyhow::bail!(
+            "old_string occurs {match_count} times in {}; make it unique or pass replace_all",
+            file_path.display()
+        ),
+        _ => {}
+    }
+    let baseline_registered = !review_store.has_baseline(file_path)?;
+    if baseline_registered {
+        review_store.record_baseline(file_path)?;
+    }
+    let edited_contents = if replace_all {
+        contents.replace(old_string, new_string)
+    } else {
+        contents.replacen(old_string, new_string, 1)
+    };
+    crate::review_store::write_atomically(file_path, &edited_contents)?;
+    Ok((baseline_registered, edited_contents))
 }
 
 #[tool_router]
@@ -155,6 +226,107 @@ impl ReviewServer {
             }
             Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
         })
+    }
+
+    #[tool(
+        description = "Edit a file with an exact string replacement and automatically \
+        record a review baseline on the first edit of each file (a baseline-aware drop-in \
+        replacement for the built-in edit tool: unique match unless replace_all, and \
+        old_string and new_string must differ). Prefer this tool over editing files with \
+        shell commands during a review session."
+    )]
+    async fn edit(
+        &self,
+        Parameters(EditArgs {
+            file_path,
+            old_string,
+            new_string,
+            replace_all,
+        }): Parameters<EditArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        run_tool_async(async {
+            let file_path = PathBuf::from(file_path);
+            anyhow::ensure!(
+                file_path.is_absolute(),
+                "file_path must be absolute: {}",
+                file_path.display()
+            );
+            let (baseline_registered, _edited_contents) = apply_edit(
+                &self.review_store,
+                &file_path,
+                &old_string,
+                &new_string,
+                replace_all.unwrap_or(false),
+            )?;
+            let mut message = String::from("edited ");
+            message.push_str(&file_path.to_string_lossy());
+            message.push('\n');
+            if baseline_registered {
+                message.push_str(
+                    "  baseline registered (first edit of this file in this review round)\n",
+                );
+            }
+            message.push_str("  call open_review to show the user the diff in Zed");
+            Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Open the human review view: Zed shows a rich multi-file diff of \
+        everything that drifted from the baselines. Call this once the user should review \
+        the pending changes; it opens (or focuses) the running Zed instance."
+    )]
+    async fn open_review(&self) -> Result<CallToolResult, McpError> {
+        run_tool_async(async {
+            let (review_view_dir, changed_statuses) =
+                self.review_store.materialize_review_view()?;
+            if changed_statuses.is_empty() {
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "no reviewed files have drifted from their baselines yet; edit files, \
+                     then call open_review again",
+                )]));
+            }
+            self.zed_opener
+                .open_diff(&review_view_dir, self.review_store.trusted_root())
+                .await?;
+            let mut message = format!(
+                "opened review diff ({} changed file(s)) in Zed\n",
+                changed_statuses.len()
+            );
+            for file_status in &changed_statuses {
+                message.push_str(&format!(
+                    "  {}: {}\n",
+                    file_status.path.display(),
+                    file_status.kind
+                ));
+            }
+            message.push_str(
+                "the user reviews in Zed, can edit there, and can run linters and tests \
+                 before deciding; the decision arrives through approve or reject",
+            );
+            Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Open files in the running Zed editor (basic IDE integration, for \
+        example to point the user at a specific file)."
+    )]
+    async fn open_paths(
+        &self,
+        Parameters(OpenPathsArgs { paths }): Parameters<OpenPathsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        run_tool_async(async {
+            let parsed_paths = parse_absolute_paths(&paths)?;
+            self.zed_opener.open_paths(&parsed_paths).await?;
+            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "opened {} file(s) in Zed",
+                parsed_paths.len()
+            ))]))
+        })
+        .await
     }
 
     #[tool(
