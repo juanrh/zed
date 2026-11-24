@@ -77,7 +77,13 @@ fn acceptance_paths(paths: Option<Vec<String>>) -> Result<Option<Vec<PathBuf>>> 
                 !parsed_paths.is_empty(),
                 "when paths are given, at least one is required (pass no paths to decide every file under review)"
             );
-            Ok(parsed_paths)
+            let mut distinct_paths = Vec::new();
+            for path in parsed_paths {
+                if !distinct_paths.contains(&path) {
+                    distinct_paths.push(path);
+                }
+            }
+            Ok(distinct_paths)
         })
         .transpose()
 }
@@ -109,10 +115,6 @@ impl ReviewServer {
             tool_router: Self::tool_router(),
         }
     }
-
-    pub fn review_store(&self) -> &ReviewStore {
-        &self.review_store
-    }
 }
 
 fn apply_edit(
@@ -121,7 +123,7 @@ fn apply_edit(
     old_string: &str,
     new_string: &str,
     replace_all: bool,
-) -> Result<(bool, String)> {
+) -> Result<bool> {
     anyhow::ensure!(!old_string.is_empty(), "old_string must not be empty");
     anyhow::ensure!(
         old_string != new_string,
@@ -153,7 +155,7 @@ fn apply_edit(
         contents.replacen(old_string, new_string, 1)
     };
     crate::review_store::write_atomically(file_path, &edited_contents)?;
-    Ok((baseline_registered, edited_contents))
+    Ok(baseline_registered)
 }
 
 #[tool_router]
@@ -251,7 +253,7 @@ impl ReviewServer {
                 "file_path must be absolute: {}",
                 file_path.display()
             );
-            let (baseline_registered, _edited_contents) = apply_edit(
+            let baseline_registered = apply_edit(
                 &self.review_store,
                 &file_path,
                 &old_string,
@@ -430,14 +432,18 @@ mod tests {
     }
 
     #[test]
-    fn test_acceptance_paths_defaults_to_all() {
+    fn test_acceptance_paths_defaults_to_all_and_dedupes() {
         assert!(acceptance_paths(None).unwrap().is_none());
         assert!(acceptance_paths(Some(vec![])).is_err());
         assert_eq!(
-            acceptance_paths(Some(vec!["/tmp/a.py".to_string()]))
-                .unwrap()
-                .unwrap(),
-            vec![PathBuf::from("/tmp/a.py")]
+            acceptance_paths(Some(vec![
+                "/tmp/a.py".to_string(),
+                "/tmp/a.py".to_string(),
+                "/tmp/b.py".to_string(),
+            ]))
+            .unwrap()
+            .unwrap(),
+            vec![PathBuf::from("/tmp/a.py"), PathBuf::from("/tmp/b.py")]
         );
     }
 
