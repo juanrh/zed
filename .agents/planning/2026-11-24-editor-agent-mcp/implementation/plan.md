@@ -3,7 +3,7 @@
 ## Checklist
 
 - [x] Step 1: Settings plumbing for `agent.editor_mcp_server`
-- [ ] Step 2: `agent` crate out-of-turn tool-run API on `Thread`
+- [x] Step 2: `agent` crate out-of-turn tool-run API on `Thread`
 - [ ] Step 3: MCP protocol module for `editor_mcp` (pure, unit-tested)
 - [ ] Step 4: `editor_mcp` dispatch core (tool registry view + pump)
 - [ ] Step 5: `editor_mcp` socket server + proxy crate
@@ -185,3 +185,30 @@ to satisfy the settings machinery — same as sibling content structs), field on
 `enabled=false`, `tools=["edit_file"]`), and three unit tests
 (`test_editor_mcp_server_{defaults,parsing,partial_content}`).
 No deviations from the plan. `cargo test -p agent_settings --lib`: 47 passed.
+
+## Implementation notes — Step 2
+
+Done: `Thread::registered_tool(s)` + `Thread::run_external_tool` + `ExternalToolRun`
+(`crates/agent/src/thread.rs`), mirroring the private `run_tool` sequence
+(restricted-mode check with a ready-Err run, fresh event stream + watch
+cancellation, InProgress status, `AnyAgentTool::run`). Deviations from plan:
+- `ExternalToolRun::events` is a raw `UnboundedReceiver<ThreadEvent>` (the
+  existing wrapper `ToolCallEventStreamReceiver` is test-gated; exposing it
+  would have widened the fork surface).
+- A restricted workspace returns `Some(run)` with a ready Err output (not
+  `None`, which the plan left unspecified) so callers can distinguish
+  "not a registered tool" from "tool refused to run".
+- Discovered while testing: `Thread::new` registers NO tools by itself;
+  `add_default_tools(environment, cx)` must be called (as `NativeAgent` does),
+  and it needs a `ThreadEnvironment`. The `agent` test module introduces
+  `FailingThreadEnvironment` (terminals/subagents unsupported); `editor_mcp`
+  will ship its own minimal one in Step 4. In-project edits are allowed by
+  default permission settings, so Step 4's confirm coverage uses a sensitive
+  path (`.zed/settings.json`), which always prompts.
+R11 check: the hidden-thread recipe here creates no ThreadStore/UI changes
+(Project::test + plain `cx.new::<Thread>`; no observe subscriptions fire —
+subscriptions live in `NativeAgent::register_session`, which we do not call).
+Tests: 3 new `#[gpui::test]`s in `agent` (allow edit — file changed +
+`Edited ...` text; deny rule — tool error, file untouched; sensitive-path
+confirmation → deny → tool error; unknown tool → None). Full `agent` lib
+suite: 821 passed, 0 failed.
