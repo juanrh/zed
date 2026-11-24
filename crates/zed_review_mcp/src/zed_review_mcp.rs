@@ -1,3 +1,4 @@
+pub mod review_server;
 pub mod review_store;
 pub mod trusted_root;
 

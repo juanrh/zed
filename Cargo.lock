@@ -22994,6 +22994,7 @@ name = "zed_review_mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "log",
  "rmcp",
  "schemars 1.0.4",
  "serde",

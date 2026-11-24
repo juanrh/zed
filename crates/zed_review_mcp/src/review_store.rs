@@ -307,39 +307,63 @@ impl ReviewStore {
             .collect())
     }
 
-    pub fn approve(&self, path: Option<&Path>) -> Result<usize> {
+    pub fn approve_all(&self) -> Result<usize> {
         let _guard = self
             .workspace_lock
             .lock()
             .map_err(|_| anyhow!("review store workspace lock poisoned"))?;
-        let targets: Vec<PathBuf> = match path {
-            Some(single) => {
-                let baseline_path = self.baseline_path(single)?;
-                anyhow::ensure!(
-                    baseline_path.exists(),
-                    "{} has no baseline; it is not under review",
-                    single.display()
-                );
-                vec![baseline_path]
-            }
-            None => self
-                .reviewed_baseline_paths()?
-                .into_iter()
-                .map(|(_relative, baseline_path)| baseline_path)
-                .collect(),
-        };
-        self.remove_baselines(targets)
+        let baselines = self
+            .reviewed_baseline_paths()?
+            .into_iter()
+            .map(|(_relative, baseline_path)| baseline_path)
+            .collect();
+        self.remove_baselines(baselines)
     }
 
-    pub fn reject(&self, path: Option<&Path>) -> Result<usize> {
+    pub fn approve_paths(&self, paths: &[PathBuf]) -> Result<usize> {
+        anyhow::ensure!(
+            !paths.is_empty(),
+            "approve requires at least one path (use approve_all to approve everything)"
+        );
         let _guard = self
             .workspace_lock
             .lock()
             .map_err(|_| anyhow!("review store workspace lock poisoned"))?;
-        let targets: Vec<PathBuf> = match path {
-            Some(single) => vec![single.to_path_buf()],
-            None => self.reviewed_paths()?,
-        };
+        let mut baselines = Vec::new();
+        for path in paths {
+            let baseline_path = self.baseline_path(path)?;
+            anyhow::ensure!(
+                baseline_path.exists(),
+                "{} has no baseline; it is not under review",
+                path.display()
+            );
+            baselines.push(baseline_path);
+        }
+        self.remove_baselines(baselines)
+    }
+
+    pub fn reject_all(&self) -> Result<usize> {
+        let _guard = self
+            .workspace_lock
+            .lock()
+            .map_err(|_| anyhow!("review store workspace lock poisoned"))?;
+        let targets = self.reviewed_paths()?;
+        self.reject_targets(targets)
+    }
+
+    pub fn reject_paths(&self, paths: &[PathBuf]) -> Result<usize> {
+        anyhow::ensure!(
+            !paths.is_empty(),
+            "reject requires at least one path (use reject_all to reject everything)"
+        );
+        let _guard = self
+            .workspace_lock
+            .lock()
+            .map_err(|_| anyhow!("review store workspace lock poisoned"))?;
+        self.reject_targets(paths.to_vec())
+    }
+
+    fn reject_targets(&self, targets: Vec<PathBuf>) -> Result<usize> {
         let mut restored_count = 0;
         for target in targets {
             let baseline_path = self.baseline_path(&target)?;
@@ -526,7 +550,7 @@ mod tests {
             vec![("whole_new_file.py".into(), FileKind::Created)]
         );
 
-        fixture.store.approve(Some(&path)).unwrap();
+        fixture.store.approve_paths(std::slice::from_ref(&path)).unwrap();
         assert!(fixture.store.status().unwrap().is_empty());
         assert!(path.is_file());
     }
@@ -633,7 +657,7 @@ mod tests {
         fixture.store.record_baseline(&path).unwrap();
         fixture.write("src/main.py", "print('proposed')\n");
 
-        fixture.store.reject(Some(&path)).unwrap();
+        fixture.store.reject_paths(std::slice::from_ref(&path)).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "print('original')\n");
         assert!(fixture.store.status().unwrap().is_empty());
@@ -646,7 +670,7 @@ mod tests {
         fixture.store.record_baseline(&path).unwrap();
         fs::remove_dir_all(fixture.root.join("a")).unwrap();
 
-        fixture.store.reject(Some(&path)).unwrap();
+        fixture.store.reject_paths(std::slice::from_ref(&path)).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "one\n");
         assert!(fixture.store.status().unwrap().is_empty());
@@ -656,7 +680,11 @@ mod tests {
     fn test_reject_errors_when_no_baseline() {
         let fixture = ReviewFixture::new();
         let path = fixture.write("wrong.py", "x");
-        let error = fixture.store.reject(Some(&path)).unwrap_err().to_string();
+        let error = fixture
+            .store
+            .reject_paths(std::slice::from_ref(&path))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("wrong.py"), "{error}");
         assert!(error.contains("no baseline"), "{error}");
     }
@@ -668,7 +696,7 @@ mod tests {
         fixture.store.record_baseline(&path).unwrap();
         fixture.write("main.py", "b\n");
 
-        fixture.store.approve(Some(&path)).unwrap();
+        fixture.store.approve_paths(std::slice::from_ref(&path)).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "b\n");
         assert!(fixture.store.status().unwrap().is_empty());
@@ -678,7 +706,11 @@ mod tests {
     fn test_approve_errors_when_no_baseline() {
         let fixture = ReviewFixture::new();
         let path = fixture.write("unreviewed.py", "x");
-        let error = fixture.store.approve(Some(&path)).unwrap_err().to_string();
+        let error = fixture
+            .store
+            .approve_paths(std::slice::from_ref(&path))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("unreviewed.py"), "{error}");
         assert!(error.contains("no baseline"), "{error}");
     }
@@ -690,7 +722,7 @@ mod tests {
         fixture.store.record_baseline(&path).unwrap();
         fixture.write("created_thing.py", "content\n");
 
-        fixture.store.reject(Some(&path)).unwrap();
+        fixture.store.reject_paths(std::slice::from_ref(&path)).unwrap();
 
         assert!(!path.exists());
         assert!(fixture.store.status().unwrap().is_empty());
@@ -709,7 +741,7 @@ mod tests {
             fs::write(&path, format!("changed\n{index}")).unwrap();
         }
 
-        let baseline_count = store.approve(None).unwrap();
+        let baseline_count = store.approve_all().unwrap();
         assert_eq!(baseline_count, 3);
         assert!(store.status().unwrap().is_empty());
         for (index, relative) in ["one.py", "two.py", "three.py"].iter().enumerate() {
@@ -725,7 +757,7 @@ mod tests {
             store.record_baseline(&path).unwrap();
             fs::write(&path, "second round\n").unwrap();
         }
-        let rejected_count = store.reject(None).unwrap();
+        let rejected_count = store.reject_all().unwrap();
         assert_eq!(rejected_count, 2);
         assert!(store.status().unwrap().is_empty());
         assert_eq!(
@@ -739,7 +771,7 @@ mod tests {
         let fixture = ReviewFixture::new();
         let path = fixture.write("a/b/c.txt", "x");
         fixture.store.record_baseline(&path).unwrap();
-        fixture.store.approve(Some(&path)).unwrap();
+        fixture.store.approve_paths(std::slice::from_ref(&path)).unwrap();
         assert!(!fixture.store.baselines_dir.join("a/b").exists());
         assert!(!fixture.store.baselines_dir.join("a").exists());
         assert!(fixture.store.baselines_dir.exists());

@@ -82,3 +82,22 @@ existing ancestor resolves outside the trusted root (symlink-escape test), and t
 restart check compares recorded-vs-requested trusted root. Verified: `cargo test -p
 zed_review_mcp` — 30 passed; `cargo clippy -p zed_review_mcp --all-targets` clean;
 `cargo fmt --check` clean. rmcp 3.11 resolves and compiles in the workspace (lock updated).
+
+---
+
+## Step 2 — Implementation notes
+
+Went as planned. Additions: rmcp 3.11 surface differs slightly from the design sketch —
+`ServerConfig` lives in `rmcp::model`, server metadata is `Implementation::new(name,
+version)`, and the tool description macro sets `listChanged=false` semantics implicitly
+(no notification support requested, matching the design). Tool failures map to
+`CallToolResult::error` (`isError=true`) per R13; protocol-level `McpError` is reserved
+for framework failures only. Store API was renamed to `approve_paths`/`approve_all`/
+`reject_paths`/`reject_all` so the tools can decide several files in one call while the
+"no paths = everything" rule stays explicit at the protocol layer (`DecisionArgs.paths`
+omitted/None). The in-process integration test implements a tiny raw JSON-RPC client over
+`tokio::io::duplex` (no extra rmcp features needed) and pins: initialize handshake,
+tools/list names, the full record → status → edit → status → reject/approve round trip,
+decide-all, and `isError` bodies naming offending paths (outside-root, re-record,
+empty paths, missing baseline). Verified: `cargo test -p zed_review_mcp` — 38 passed
+(34 unit + 4 protocol); `cargo clippy --all-targets` clean; `cargo fmt --check` clean.
