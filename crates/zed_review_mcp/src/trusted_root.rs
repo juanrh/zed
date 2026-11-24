@@ -5,7 +5,7 @@ pub async fn resolve_trusted_root(starting_directory: &Path) -> Result<PathBuf> 
     let output = smol::process::Command::new("git")
         .arg("rev-parse")
         .arg("--show-toplevel")
-        .current_dir(starting_directory.to_path_buf())
+        .current_dir(starting_directory)
         .output()
         .await
         .context("running `git rev-parse --show-toplevel`")?;
