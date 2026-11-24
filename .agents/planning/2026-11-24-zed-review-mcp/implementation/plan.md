@@ -62,3 +62,23 @@ handshake → record → edit → status → reject (against a fake `zed`) over 
 **Demo:** run the released binary: `record_baseline` then `open_review` invokes the real
 `zed --diff <snapshot> <root>` (fake in tests); the agent round completes, working tree
 restored on reject.
+
+---
+
+## Step 1 — Implementation notes
+
+Went as planned. Additions forced by Zed workspace conventions: `[lints] workspace = true`,
+`doctest = false`, `publish.workspace = true`, `license = "GPL-3.0-or-later"`. Clippy's
+`disallowed_methods` forbids `std::process::Command`, and the workspace convention is
+`smol::process`, so `resolve_trusted_root` became async (tests wrap it with
+`smol::block_on`). One semantic refinement over the design text surfaced while writing
+tests: a zero-byte creation baseline always reports `created` (Aletheia keeps
+`marked_for_creation` as a separate reply list; reporting `removed` for a not-yet-created
+file was misleading) — `removed` is reserved for deleted files that had baseline content.
+`approve` resolves the baseline for the single-path case up front so the error names the
+requested path, not the snapshot; the whole-baseline case operates on snapshot paths
+directly. Also changed during testing: `confine` was fixed to reject paths whose nearest
+existing ancestor resolves outside the trusted root (symlink-escape test), and the session
+restart check compares recorded-vs-requested trusted root. Verified: `cargo test -p
+zed_review_mcp` — 30 passed; `cargo clippy -p zed_review_mcp --all-targets` clean;
+`cargo fmt --check` clean. rmcp 3.11 resolves and compiles in the workspace (lock updated).
