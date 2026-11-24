@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "zed-edit-file-mcp"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Standalone MCP server exposing Zed's agent edit_file tool semantics over the Model Context Protocol"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "zed-edit-file-mcp"
+path = "src/main.rs"
