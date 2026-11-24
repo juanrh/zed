@@ -6,7 +6,6 @@ use crate::dispatch::EditorMcpDispatcher;
 use crate::protocol::{self, Message, ToolCallOutcome};
 use gpui::{AppContext, Context, Entity, EventEmitter};
 use project::Project;
-use settings::Settings;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -273,6 +272,18 @@ impl EditorMcpServer {
             conn.pending_calls = conn.pending_calls.saturating_sub(1);
         }
         let _ = response_tx.try_send(protocol::tools_call_result(id, &outcome));
+    }
+
+    /// Stops serving this workspace: cancels every in-flight call and removes
+    /// the socket file. In-flight connections see their runs cancel; new
+    /// connections find no socket.
+    pub fn shutdown(&mut self) {
+        let pending: Vec<PendingCall> = self.pending.drain().map(|(_, call)| call).collect();
+        for call in pending {
+            let _ = call.cancel.send(());
+        }
+        self.connections.clear();
+        let _ = std::fs::remove_file(&self.socket_path);
     }
 
     fn handle_disconnect(&mut self, conn_id: u64) {

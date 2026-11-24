@@ -6573,6 +6573,7 @@ mod tests {
                 cx,
             );
 
+            editor_mcp::store::init(cx);
             repl::init(app_state.fs.clone(), cx);
             repl::notebook::init(cx);
             tasks_ui::init(cx);

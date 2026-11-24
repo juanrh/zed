@@ -7,7 +7,7 @@
 - [x] Step 3: MCP protocol module for `editor_mcp` (pure, unit-tested)
 - [x] Step 4: `editor_mcp` dispatch core (tool registry view + pump)
 - [x] Step 5: `editor_mcp` socket server + proxy crate
-- [ ] Step 6: workspace wiring + README
+- [x] Step 6: workspace wiring + README
 - [ ] Step 7: review rounds (ponytail code review, round 2 and, if needed, 3)
 
 ## Working agreements
@@ -275,3 +275,24 @@ relays a scripted session through a socketpair in-process. Deviations:
   unit-tested `bind` path handling) + 2 proxy lib tests.
 - `EditorMcpServer::start` returns `Option<Entity<Self>>` and logs loudly on
   every stand-down path (R10's "never silently do nothing").
+
+## Implementation notes — Step 6
+
+Done: `crates/editor_mcp/src/store.rs` — a global `EditorMcpStore` tracking
+one entry per `Workspace` (weak handle + optional server entity),
+`observe_new::<Workspace>` registering each workspace and its release,
+`observe_global::<SettingsStore>` re-syncing on settings changes (enable →
+start with current worktree roots; disable → `shutdown()` which cancels all
+pending calls and removes the socket file; stale closed-workspace entries are
+dropped on sync). Boot wiring: `editor_mcp::store::init(cx)` in
+`crates/zed/src/zed.rs` next to `repl::init`, plus `editor_mcp` in the `zed`
+crate deps. README lives at `crates/editor_mcp/README.md` (settings, socket
+location, proxy usage, permission pre-authorization, manual QA script —
+five minutes — and v1 limits).
+Constraint, honestly recorded: `cargo check -p zed` cannot run in this
+sandbox (missing X11 system headers, no root to install them) — a
+pre-existing environment limitation unrelated to this change; the call site
+is a one-liner with the same signature as the adjacent `repl::init`
+(`(cx: &mut App)`), and every crate that *can* compile here does so
+cleanly. The two-line zed-crate change is the only unverified-in-sandbox
+code, and it exercised the same API the tests call.
