@@ -100,14 +100,27 @@ flowchart LR
 Owns the baseline registry. **State on disk**: the session directory contains
 
 ```
-<session_dir>/trusted-root        # one-line absolute path of the trusted root
-<session_dir>/baselines/<relative path>   # snapshot content, mirroring project layout
+<session_dir>/trusted-root                     # one-line absolute path of the trusted root
+<session_dir>/baselines/<relative path>         # snapshot content, mirroring project layout
+<session_dir>/creations/<relative path>         # empty marker files for marked-for-creation files
+<session_dir>/review-baseline-view/<relative>   # baseline side of the review diff view
+<session_dir>/review-work-view/<relative>       # working-tree side of the review diff view
 ```
 
-A file is under review **iff** a corresponding file exists under `baselines/`. A
-`marked for creation` file is represented by a **zero-byte** snapshot — this is exactly
-what Zed's own CLI does with stubs, keeps the model one-directory, and makes the whole
-review state inspectable by any tool (and by `zed --diff` directly).
+A file is under review **iff** a corresponding file exists under `baselines/` (it existed
+snapshot) **or** `creations/` (it was marked for creation). Keeping creation markers in
+their own tree (rather than encoding them as zero-byte snapshots) removes the ambiguity
+with genuinely empty files: rejecting an approved empty file restores original content
+instead of deleting it, and recording an empty file that later receives content is
+reported as `modified`, not `created`.
+
+`open_review` materializes a fresh pair of review views per call — `review-baseline-view`
+mirrors the baseline of every changed file, `review-work-view` mirrors its current
+working content — and opens `zed --diff <review-baseline-view> <review-work-view>`. Using
+the session views as **both** sides (instead of the project root as the right side)
+matters: the Zed CLI expands directory pairs into per-file diffs and stubs right-only
+files with empty left files, so pairing against the whole trusted root would display the
+entire repository as changes.
 
 Public API (all fallible, all errors carry the offending path):
 

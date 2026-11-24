@@ -279,8 +279,8 @@ impl ReviewServer {
     )]
     async fn open_review(&self) -> Result<CallToolResult, McpError> {
         run_tool_async(async {
-            let (review_view_dir, changed_statuses) =
-                self.review_store.materialize_review_view()?;
+            let (baseline_view_dir, work_view_dir, changed_statuses) =
+                self.review_store.materialize_review_views()?;
             if changed_statuses.is_empty() {
                 return Ok(CallToolResult::success(vec![ContentBlock::text(
                     "no reviewed files have drifted from their baselines yet; edit files, \
@@ -288,7 +288,7 @@ impl ReviewServer {
                 )]));
             }
             self.zed_opener
-                .open_diff(&review_view_dir, self.review_store.trusted_root())
+                .open_diff(&baseline_view_dir, &work_view_dir)
                 .await?;
             let mut message = format!(
                 "opened review diff ({} changed file(s)) in Zed\n",

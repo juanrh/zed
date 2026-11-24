@@ -172,8 +172,9 @@ fn test_binary_serves_full_review_round_trip_over_stdio() {
     assert_eq!(invocations.len(), 1, "{invocations:?}");
     assert!(
         invocations[0].starts_with("--diff ")
-            && invocations[0].ends_with(project.root.to_string_lossy().as_ref()),
-        "{invocations:?}"
+            && invocations[0].contains("review-baseline-view")
+            && invocations[0].contains("review-work-view"),
+        "the diff must span the session review views, not the whole project: {invocations:?}"
     );
 
     let (is_error, reply) = server

@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result, anyhow};
+use std::path::Component;
 use std::path::{Path, PathBuf};
 
 pub async fn resolve_trusted_root(starting_directory: &Path) -> Result<PathBuf> {
@@ -40,6 +41,15 @@ pub fn confine(path: &Path, trusted_root: &Path) -> Result<PathBuf> {
         "trusted root must be absolute: {}",
         trusted_root.display()
     );
+    for component in path.components() {
+        if !matches!(component, Component::Normal(_) | Component::RootDir) {
+            anyhow::bail!(
+                "path must not contain `.` or `..` components: {} \
+                 (the review session only accepts clean absolute paths)",
+                path.display()
+            );
+        }
+    }
 
     if let Ok(existing) = path.canonicalize() {
         return if existing.starts_with(trusted_root) {
@@ -170,6 +180,16 @@ mod tests {
         fs::write(&escape, "secrets").unwrap();
         symlink(&escape, root.join("inside_link")).unwrap();
         assert!(confine(&root.join("inside_link"), &root).is_err());
+    }
+
+    #[test]
+    fn test_confine_rejects_dotdot_components() {
+        let (_temp_dir, root) = temp_root();
+        let escaping = root.join("missing/../../escaped.py");
+        assert!(confine(&escaping, &root).is_err());
+
+        let crossing = root.join("sub/../../file.py");
+        assert!(confine(&crossing, &root).is_err());
     }
 
     #[test]

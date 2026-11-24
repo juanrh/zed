@@ -329,10 +329,11 @@ async fn test_edit_tool_registers_baseline_and_open_review_spawns_zed_diff() {
     fake_zed.wait_for_invocation();
     let invocations = fake_zed.recorded_invocations();
     assert_eq!(invocations.len(), 1, "{invocations:?}");
-    assert!(invocations[0].starts_with("--diff "), "{invocations:?}");
     assert!(
-        invocations[0].ends_with(project.root.to_string_lossy().as_ref()),
-        "the right side of the diff must be the project root: {invocations:?}"
+        invocations[0].starts_with("--diff ")
+            && invocations[0].contains("review-baseline-view")
+            && invocations[0].contains("review-work-view"),
+        "the diff must span the session review views, not the whole project: {invocations:?}"
     );
 
     let outcome = client
