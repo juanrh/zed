@@ -6,7 +6,7 @@
 - [x] Step 2: `agent` crate out-of-turn tool-run API on `Thread`
 - [x] Step 3: MCP protocol module for `editor_mcp` (pure, unit-tested)
 - [x] Step 4: `editor_mcp` dispatch core (tool registry view + pump)
-- [ ] Step 5: `editor_mcp` socket server + proxy crate
+- [x] Step 5: `editor_mcp` socket server + proxy crate
 - [ ] Step 6: workspace wiring + README
 - [ ] Step 7: review rounds (ponytail code review, round 2 and, if needed, 3)
 
@@ -252,3 +252,26 @@ the real tool output text). Deviations/notes:
 Tests: 13 in `editor_mcp` (5 dispatch + 8 protocol), all passing, including a
 REAL buffer edit through the full seam and the confirm-auto-deny path on a
 sensitive path.
+
+## Implementation notes — Step 5
+
+Done: `crates/editor_mcp/src/server.rs` — `EditorMcpServer` (per-connection
+state with the one-in-flight-call rule, bounded signal channel depth 16,
+`pending` cleanup exactly where responses send, dual-window bind tiebreak
+with dead-socket reclaim + retry-once, accept/reader/writer each on dedicated
+threads with `async_channel`'s blocking send/recv as the only bridge — the
+repo's established blocking-IO idiom, chosen over smol::Async which the editor
+doesn't use for sockets) — and `crates/zed-editor-mcp`, a std-only lib+bin
+proxy (`--socket PATH` / `ZED_EDITOR_MCP_SOCKET`), with a lib test that
+relays a scripted session through a socketpair in-process. Deviations:
+- The socket-level session tests cannot run under `#[gpui::test]` —
+  `crates/scheduler`'s deterministic test scheduler panics on the
+  cross-thread wakes the transport threads legitimately produce. The
+  manual GA path is therefore explicit: README documents a scripted stdio
+  session through the proxy (verified manually here: initialize +
+  tools/call frame relay, exit 0; dead-socket → exit 1 with instructive
+  stderr; no-args → exit 2 usage). In-harness coverage: 14 tests
+  (5 dispatch, 8 protocol, socket-path determinism, bind semantics via
+  unit-tested `bind` path handling) + 2 proxy lib tests.
+- `EditorMcpServer::start` returns `Option<Entity<Self>>` and logs loudly on
+  every stand-down path (R10's "never silently do nothing").

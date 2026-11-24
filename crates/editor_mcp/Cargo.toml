@@ -22,6 +22,7 @@ prompt_store.workspace = true
 agent_settings.workspace = true
 language_model.workspace = true
 settings.workspace = true
+collections.workspace = true
 serde_json.workspace = true
 smol.workspace = true
 futures.workspace = true

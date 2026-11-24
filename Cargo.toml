@@ -247,6 +247,7 @@ members = [
     "crates/x_ai",
     "crates/x_ai_subscribed",
     "crates/zed",
+    "crates/zed-editor-mcp",
     "crates/zed_actions",
     "crates/zed_credentials_provider",
     "crates/zed_env_vars",
