@@ -8,7 +8,7 @@
 - [x] Step 4: `editor_mcp` dispatch core (tool registry view + pump)
 - [x] Step 5: `editor_mcp` socket server + proxy crate
 - [x] Step 6: workspace wiring + README
-- [ ] Step 7: review rounds (ponytail code review, round 2 and, if needed, 3)
+- [x] Step 7: review rounds (ponytail code review, round 2 and, if needed, 3)
 
 ## Working agreements
 

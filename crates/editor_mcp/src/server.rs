@@ -183,6 +183,7 @@ impl EditorMcpServer {
             // Notifications get no reply per JSON-RPC; malformed request
             // frames get a protocol error so nothing waits on them forever.
             Message::UnknownMethod { id: None, method } => {
+                let method: String = method.chars().take(64).collect();
                 log::warn!("editor MCP server dropped an unknown notification: {method}");
             }
             Message::Invalid(reason) => {
