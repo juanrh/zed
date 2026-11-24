@@ -5707,6 +5707,19 @@ impl ExternalToolRun {
     pub fn cancel(&mut self) {
         self.cancellation_tx.send(true).ok();
     }
+
+    /// Consumes the run, yielding the pieces needed to pump it independently:
+    /// the in-flight task, its event receiver, and the cancellation sender
+    /// (send `true` to request cancellation).
+    pub fn into_parts(
+        self,
+    ) -> (
+        Task<Result<AgentToolOutput, AgentToolOutput>>,
+        mpsc::UnboundedReceiver<Result<ThreadEvent>>,
+        watch::Sender<bool>,
+    ) {
+        (self.task, self.events, self.cancellation_tx)
+    }
 }
 
 impl From<anyhow::Error> for AgentToolOutput {

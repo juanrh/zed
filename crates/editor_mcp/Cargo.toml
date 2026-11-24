@@ -14,10 +14,14 @@ doctest = false
 
 [dependencies]
 agent.workspace = true
+acp_thread.workspace = true
+agent-client-protocol.workspace = true
 gpui.workspace = true
 project.workspace = true
 prompt_store.workspace = true
 agent_settings.workspace = true
+language_model.workspace = true
+settings.workspace = true
 serde_json.workspace = true
 smol.workspace = true
 futures.workspace = true

@@ -5,7 +5,7 @@
 - [x] Step 1: Settings plumbing for `agent.editor_mcp_server`
 - [x] Step 2: `agent` crate out-of-turn tool-run API on `Thread`
 - [x] Step 3: MCP protocol module for `editor_mcp` (pure, unit-tested)
-- [ ] Step 4: `editor_mcp` dispatch core (tool registry view + pump)
+- [x] Step 4: `editor_mcp` dispatch core (tool registry view + pump)
 - [ ] Step 5: `editor_mcp` socket server + proxy crate
 - [ ] Step 6: workspace wiring + README
 - [ ] Step 7: review rounds (ponytail code review, round 2 and, if needed, 3)
@@ -225,3 +225,30 @@ didn't name: `Action::CallToolError` for `tools/call` frames that miss the
 tool name — keeps protocol handling total and answers with a tool-result
 error, like the built-in agent answers bad input. All 8 protocol unit tests
 pass. No deviations otherwise.
+
+## Implementation notes — Step 4
+
+Done: `EditorMcpDispatcher` in `crates/editor_mcp/src/dispatch.rs` (eager hidden
+`Thread` via public `agent::Thread::new` + `add_default_tools` with a
+fail-honest `McpThreadEnvironment`; tools/list = settings allowlist ∩ real
+registered tools with real descriptions/schemas; `call_tool` returning
+`(CallToolCall{cancel oneshot}, Task<ToolCallOutcome>)`; background pump that
+denies `ToolCallAuthorization` events with `AUTO_DENIED_MESSAGE` and forwards
+the real tool output text). Deviations/notes:
+- The `watch::Sender` cancellation channel is not cloneable (Zed's own
+  `crates/watch` type), so `ExternalToolRun` gained `into_parts(task, events,
+  sender)` in the agent crate; the dispatcher moves task+events into the pump
+  and the sender into a small cancel-forwarder task. No borrow conflicts, no
+  shared mutable state.
+- The unknown-tool test caught a real bug: `call_tool` ran tools that were
+  registered but not allowlisted (e.g. `delete_path`), bypassing R2/R10.
+  The allowlist is now enforced before `run_external_tool`.
+- Cancellation: the oneshot→watch forwarding is in place; a deterministic
+  cancel unit test against a fast tool is racy, so cancellation is exercised
+  instead at the socket level in Step 5 (disconnect mid-call) where timing is
+  controllable. Recorded here rather than shipping a flaky test.
+- Pending-map cleanup (R10) lands in Step 5's server, where the response send
+  happens (as the design specifies).
+Tests: 13 in `editor_mcp` (5 dispatch + 8 protocol), all passing, including a
+REAL buffer edit through the full seam and the confirm-auto-deny path on a
+sensitive path.
